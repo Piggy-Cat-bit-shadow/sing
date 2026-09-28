@@ -1,6 +1,7 @@
 package byteformats
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -104,6 +105,11 @@ func parseUnit(b *rawBytes, unitTable map[string]uint64, caseSensitive bool, byt
 	var intValue int64
 	err := json.Unmarshal(bytes, &intValue)
 	if err == nil {
+		if intValue < 0 {
+			// Converting a negative int64 to uint64 yields a huge positive value,
+			// so a negative limit would silently become an enormous one.
+			return E.New("value must not be negative: ", intValue)
+		}
 		b.value = uint64(intValue)
 		b.unit = ""
 		b.unitValue = 1
@@ -122,6 +128,15 @@ func parseUnit(b *rawBytes, unitTable map[string]uint64, caseSensitive bool, byt
 		}
 	}
 	if unitIndex == 0 {
+		// A string with no leading digit at all. The one case worth accepting is a
+		// bare "0": MarshalJSON emits "0" for the zero value, so rejecting it left
+		// the type unable to read back what it writes.
+		if stringValue == "0" {
+			b.value = 0
+			b.unit = ""
+			b.unitValue = 1
+			return nil
+		}
 		return E.New("invalid format: ", stringValue)
 	}
 	value, err := strconv.ParseUint(stringValue[:unitIndex], 10, 64)
@@ -138,6 +153,14 @@ func parseUnit(b *rawBytes, unitTable map[string]uint64, caseSensitive bool, byt
 	unitValue, loaded := unitTable[unit]
 	if !loaded {
 		return E.New("unsupported unit: ", rawUnit)
+	}
+	// The multiplication must not wrap. Without this check a value such as
+	// "16e" (16 EiB) silently became 0, and the consumer then treated the
+	// setting as unset - so a configured limit was accepted and ignored rather
+	// than reported. Report the overflow instead of wrapping.
+	if unitValue != 0 && value > math.MaxUint64/unitValue {
+		return E.New("value overflows: ", stringValue, " (", value, " * ", unitValue,
+			" exceeds ", uint64(math.MaxUint64), ")")
 	}
 	b.value = value * unitValue
 	b.unit = rawUnit
