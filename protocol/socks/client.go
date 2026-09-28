@@ -56,6 +56,7 @@ type Client struct {
 	serverAddr M.Socksaddr
 	username   string
 	password   string
+	preconnect *preconnectPool
 }
 
 func NewClient(dialer N.Dialer, serverAddr M.Socksaddr, version Version, username string, password string) *Client {
@@ -66,6 +67,32 @@ func NewClient(dialer N.Dialer, serverAddr M.Socksaddr, version Version, usernam
 		username:   username,
 		password:   password,
 	}
+}
+
+// EnablePreconnect attaches an authenticated idle connection pool.
+//
+// It is only valid for SOCKS5 TCP CONNECT. The pool is opt-in: a caller that never
+// invokes this keeps the previous behaviour exactly, including starting no
+// goroutine and opening no extra socket.
+//
+// The pool must be closed by the owner, typically from the outbound's Close.
+func (c *Client) EnablePreconnect(options PreconnectOptions) error {
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	if c.version != Version5 {
+		return E.New("socks: tcp_preconnect requires version 5, got ", c.version)
+	}
+	c.preconnect = newPreconnectPool(c, options)
+	return nil
+}
+
+// Close stops the preconnect pool, if any.
+func (c *Client) Close() error {
+	if c.preconnect != nil {
+		return c.preconnect.Close()
+	}
+	return nil
 }
 
 func NewClientFromURL(dialer N.Dialer, rawURL string) (*Client, error) {
@@ -113,6 +140,24 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 		command = socks5.CommandUDPAssociate
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
+	}
+	// A warm, already-authenticated connection moves greeting and authentication off
+	// this request's critical path. It is used ONLY for a TCP CONNECT: every other
+	// command (UDP ASSOCIATE, BIND) keeps the cold path, because the pool is defined
+	// for TCP CONNECT alone.
+	//
+	// A warm connection can be stale - the proxy's idle timeout, a NAT rebind, a
+	// server reset - so a failure BEFORE the command is accepted falls back to
+	// exactly one cold attempt. A warm failure must never become a user-visible
+	// failure when a cold connection would have worked.
+	if c.preconnect != nil && command == socks5.CommandConnect {
+		if warm := c.preconnect.acquire(); warm != nil {
+			warmResult, warmErr := c.preconnect.commandOnWarm(warm, command, address)
+			if warmErr == nil {
+				return warmResult, nil
+			}
+			// Exactly one cold retry follows; never a loop.
+		}
 	}
 	tcpConn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
