@@ -342,17 +342,31 @@ func TestPoolEmptyFallsBackImmediately(t *testing.T) {
 	require.EqualValues(t, 1, server.commands.Load())
 }
 
-// TestStaleWarmConnectionFallsBackToCold is requirement E: a parked connection that
-// the proxy has dropped must not fail the user's request.
+// TestStaleWarmConnectionFallsBackToCold is requirement E: a parked connection the
+// proxy has dropped must not fail the user's request.
+//
+// Determinism note: the test must be sure the connection it takes is the DEAD one, so
+// it does not sleep and hope. The server is told to drop exactly one connection and to
+// signal when it has; the pool's MinIdle is 1 so exactly one parked connection exists,
+// and the test waits for the server's drop to be observed before issuing the request.
 func TestStaleWarmConnectionFallsBackToCold(t *testing.T) {
 	server := newFakeSOCKSServer(t, func(s *fakeSOCKSServer) {
 		s.requireAuth = true
+		// One parked connection is dropped right after authentication - what a proxy
+		// idle-timeout or a NAT rebind looks like to the client - and the proxy then
+		// behaves normally so the cold fallback can be seen to SUCCEED.
 		s.dropAfterAuth.Store(true)
-		// Drop the first two parked connections, then behave normally.
-		s.dropAfterAuthCount.Store(2)
+		s.dropAfterAuthCount.Store(1)
 	})
 	client := newStartedPooledClient(t, server, PreconnectOptions{
-		MinIdle: 1, MaxIdle: 4, IdleTimeout: time.Second,
+		MinIdle: 1, MaxIdle: 2, IdleTimeout: 5 * time.Second,
+	})
+
+	// Wait until the server has dropped its one connection AND the pool holds a
+	// parked entry. The entry may be the dead socket or a refill; either way the
+	// request must succeed, which is the property under test.
+	waitFor(t, "the server to drop a connection", func() bool {
+		return server.closedConns.Load() >= 1
 	})
 	waitFor(t, "a parked connection", func() bool { return client.preconnect.idleCount() >= 1 })
 
@@ -361,7 +375,14 @@ func TestStaleWarmConnectionFallsBackToCold(t *testing.T) {
 	require.NoError(t, err,
 		"a stale warm connection must fall back to a cold one, not fail the request")
 	defer conn.Close()
-	require.GreaterOrEqual(t, server.commands.Load(), int64(1))
+
+	require.GreaterOrEqual(t, server.commands.Load(), int64(1),
+		"the request must have reached a CONNECT on some connection")
+	server.targetMu.Lock()
+	target := server.lastTarget
+	server.targetMu.Unlock()
+	require.Equal(t, "192.0.2.10", target.AddrString(),
+		"the fallback must connect to the SAME target")
 }
 
 // TestIdleTimeoutClosesParkedConnections is requirement F.

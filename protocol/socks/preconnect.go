@@ -367,3 +367,37 @@ type warmConn struct {
 }
 
 func (c *warmConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+// --- Accessors used by sing-box's configuration tests ------------------------
+//
+// These exist so the configuration layer can assert the EFFECTIVE pool parameters
+// after defaults are applied, and that constructing an outbound does not start the
+// loop. They are read-only and add no behaviour.
+
+// PreconnectPoolForTest reports the client's pool, or nil when none is configured.
+func (c *Client) PreconnectPoolForTest() *preconnectPool {
+	return c.preconnect
+}
+
+// MinIdleForTest reports the effective MinIdle.
+func (p *preconnectPool) MinIdleForTest() int { return p.options.MinIdle }
+
+// MaxIdleForTest reports the effective MaxIdle.
+func (p *preconnectPool) MaxIdleForTest() int { return p.options.MaxIdle }
+
+// IdleTimeoutForTest reports the effective IdleTimeout.
+func (p *preconnectPool) IdleTimeoutForTest() time.Duration { return p.options.IdleTimeout }
+
+// StartedForTest reports whether the refill loop has been started.
+func (p *preconnectPool) StartedForTest() bool {
+	select {
+	case <-p.done:
+		// Already finished: it must have been started (and closed).
+		return true
+	default:
+	}
+	p.mu.Lock()
+	cancel := p.cancel
+	p.mu.Unlock()
+	return cancel != nil
+}
