@@ -50,8 +50,23 @@ func ClientHandshake4(conn io.ReadWriter, command byte, destination M.Socksaddr,
 	return response, err
 }
 
-func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr, username string, password string) (socks5.Response, error) {
-	reader := varbin.StubReader(conn)
+// ClientNegotiate5 performs the SOCKS5 greeting and, when the server selects
+// username/password authentication, the authentication exchange.
+//
+// It stops at the point where the connection is authenticated and ready to carry
+// a command. Nothing is written after authentication, so the caller may hold the
+// connection in that state and send the command later. This is what makes an
+// authenticated connection poolable: the expensive part of the handshake can
+// happen ahead of the request that needs it.
+//
+// A SOCKS5 connection carries exactly ONE command. A connection returned by this
+// function is therefore single-use: after ClientCommand5 it has become a tunnel
+// and must never be returned to a pool or reused for another destination.
+//
+// reader must be the buffered reader used for the whole connection. The caller
+// must reuse the SAME reader for ClientCommand5, because the server's reply may
+// already sit in its buffer.
+func ClientNegotiate5(conn io.Writer, reader varbin.Reader, username string, password string) error {
 	var method byte
 	if username == "" {
 		method = socks5.AuthTypeNotRequired
@@ -62,11 +77,11 @@ func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr,
 		Methods: []byte{method},
 	})
 	if err != nil {
-		return socks5.Response{}, err
+		return err
 	}
 	authResponse, err := socks5.ReadAuthResponse(reader)
 	if err != nil {
-		return socks5.Response{}, err
+		return err
 	}
 	if authResponse.Method == socks5.AuthTypeUsernamePassword {
 		err = socks5.WriteUsernamePasswordAuthRequest(conn, socks5.UsernamePasswordAuthRequest{
@@ -74,19 +89,26 @@ func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr,
 			Password: password,
 		})
 		if err != nil {
-			return socks5.Response{}, err
+			return err
 		}
 		usernamePasswordResponse, err := socks5.ReadUsernamePasswordAuthResponse(reader)
 		if err != nil {
-			return socks5.Response{}, err
+			return err
 		}
 		if usernamePasswordResponse.Status != socks5.UsernamePasswordStatusSuccess {
-			return socks5.Response{}, E.New("socks5: incorrect user name or password")
+			return E.New("socks5: incorrect user name or password")
 		}
 	} else if authResponse.Method != socks5.AuthTypeNotRequired {
-		return socks5.Response{}, E.New("socks5: unsupported auth method: ", authResponse.Method)
+		return E.New("socks5: unsupported auth method: ", authResponse.Method)
 	}
+	return nil
+}
 
+// ClientCommand5 sends a SOCKS5 request for command and reads the reply.
+//
+// It must be preceded by ClientNegotiate5 on the same connection and reader. See
+// that function for the single-use rule.
+func ClientCommand5(conn io.Writer, reader varbin.Reader, command byte, destination M.Socksaddr) (socks5.Response, error) {
 	if command == socks5.CommandUDPAssociate {
 		if destination.Addr.IsPrivate() {
 			if destination.Addr.Is6() {
@@ -106,7 +128,7 @@ func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr,
 		destination.Port = 0
 	}
 
-	err = socks5.WriteRequest(conn, socks5.Request{
+	err := socks5.WriteRequest(conn, socks5.Request{
 		Command:     command,
 		Destination: destination,
 	})
@@ -121,6 +143,21 @@ func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr,
 		err = E.New("socks5: request rejected, code=", response.ReplyCode)
 	}
 	return response, err
+}
+
+// ClientHandshake5 performs the complete SOCKS5 handshake: negotiation,
+// authentication and one command.
+//
+// It is the composition of ClientNegotiate5 and ClientCommand5 and behaves
+// exactly as before the split, including the UDP ASSOCIATE address rewriting
+// performed by ClientCommand5.
+func ClientHandshake5(conn io.ReadWriter, command byte, destination M.Socksaddr, username string, password string) (socks5.Response, error) {
+	reader := varbin.StubReader(conn)
+	err := ClientNegotiate5(conn, reader, username, password)
+	if err != nil {
+		return socks5.Response{}, err
+	}
+	return ClientCommand5(conn, reader, command, destination)
 }
 
 func HandleConnectionEx(
