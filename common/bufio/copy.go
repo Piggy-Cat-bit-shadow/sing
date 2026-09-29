@@ -572,10 +572,26 @@ func CopyPacketConn(ctx context.Context, source N.PacketConn, destination N.Pack
 //
 // # Ownership
 //
-// On success the writer consumes the buffer, matching N.ExtendedWriter.WriteBuffer's contract
-// elsewhere in this package -- the copy loops call it and do not release. The bool exists so the
-// caller knows NOT to release, rather than relying on a Release being harmless. On failure the
-// buffer is untouched and still the caller's.
+// Ownership transfers the moment WriteBuffer is ENTERED, and the ERROR RESULT DOES NOT CHANGE THAT.
+// Every N.ExtendedWriter releases the buffer itself, with a `defer`:
+//
+//	ExtendedWriterWrapper.WriteBuffer:  defer buffer.Release(); return common.Error(w.Write(...))
+//	ChunkWriter.WriteBuffer:            defer buffer.Release() on the oversized branch
+//
+// so the release runs on both the nil and the non-nil return. The bool therefore reports only
+// whether the buffer was handed to WriteBuffer at all.
+//
+// # Why the error return must NOT return false
+//
+// An earlier revision returned `err, false` when WriteBuffer failed, on the reasoning that a failed
+// write had not consumed the buffer. That is wrong: it makes the caller release a buffer the writer
+// already released. The second release is not a benign double free -- buf.Buffer.Release() zeroes
+// the struct and returns the backing array to the pool, so the caller's call is a silent no-op on an
+// already-cleared struct while the ARRAY has already been handed to whoever allocates next. The
+// corruption shows up later, in unrelated traffic, rather than here.
+//
+// The failure paths ABOVE this point (no ExtendedWriter, MTU, headroom) return false correctly:
+// they never enter WriteBuffer, so they never transfer ownership.
 func WriteOwnedBuffer(destination io.Writer, buffer *buf.Buffer) (error, bool) {
 	writer := N.UnwrapWriter(destination)
 	extendedWriter, isExtendedWriter := writer.(N.ExtendedWriter)
@@ -603,9 +619,6 @@ func WriteOwnedBuffer(destination io.Writer, buffer *buf.Buffer) (error, bool) {
 			return err, false
 		}
 	}
-	err := extendedWriter.WriteBuffer(buffer)
-	if err != nil {
-		return err, false
-	}
-	return nil, true
+	// From here the buffer is the writer's, whatever WriteBuffer returns.
+	return extendedWriter.WriteBuffer(buffer), true
 }

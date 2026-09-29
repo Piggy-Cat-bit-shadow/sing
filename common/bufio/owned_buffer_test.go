@@ -32,6 +32,8 @@ type geometryDestination struct {
 	lastPlainData   []byte
 	lastBufferLen   int
 	failWriteBuffer bool
+	// releases counts handovers the fixture released, which is the ownership record.
+	releases int
 }
 
 func (d *geometryDestination) Write(p []byte) (int, error) {
@@ -43,15 +45,40 @@ func (d *geometryDestination) Write(p []byte) (int, error) {
 }
 
 func (d *geometryDestination) writeBuffer(buffer *buf.Buffer) error {
+	// The release is a DEFER, before the error is known, because that is what every real
+	// N.ExtendedWriter does:
+	//
+	//	ExtendedWriterWrapper.WriteBuffer: defer buffer.Release(); return common.Error(w.Write(...))
+	//	ChunkWriter.WriteBuffer:           defer buffer.Release() on the oversized branch
+	//
+	// An earlier version of this fixture released only on the SUCCESS path. That modelled a
+	// contract no writer has, and it is why WriteOwnedBuffer's double release went unnoticed: the
+	// test asserted the wrong behaviour and the fixture quietly agreed.
+	defer func() {
+		d.access.Lock()
+		d.releases++
+		d.access.Unlock()
+		buffer.Release()
+	}()
+
 	d.access.Lock()
 	defer d.access.Unlock()
 	if d.failWriteBuffer {
+		d.bufferWrites++
 		return errors.New("test: WriteBuffer failed")
 	}
 	d.bufferWrites++
 	d.lastBufferLen = buffer.Len()
-	buffer.Release()
 	return nil
+}
+
+// releaseCount reports how many times the fixture released a handover. It is the ownership RECORD:
+// buf.Buffer.Release() is idempotent from the outside, so "did the caller also release" is not
+// observable on the buffer itself.
+func (d *geometryDestination) releaseCount() int {
+	d.access.Lock()
+	defer d.access.Unlock()
+	return d.releases
 }
 
 // fullGeometry has both capability sets plus the extended writer.
@@ -186,9 +213,21 @@ func TestWriteOwnedBufferWithoutExtendedWriter(t *testing.T) {
 
 // TestWriteOwnedBufferOwnershipOnError is the ownership case that matters most.
 //
-// A failed WriteBuffer means the writer did not take the buffer, so the caller must release it.
-// Reporting a hand-off there would leak the buffer; reporting the fallback would be a double
-// release, because the caller would release something the callee already had.
+// # The contract this asserts, and the one it used to assert
+//
+// Ownership transfers the moment WriteBuffer is ENTERED, and the error result does not change that:
+// every N.ExtendedWriter releases the buffer with a `defer`, which runs on the error path too. So a
+// failed WriteBuffer must still report handedOver=true and the caller must NOT release.
+//
+// The previous version asserted the opposite -- that a failed WriteBuffer leaves the buffer with the
+// caller -- and the fixture cooperated by releasing only on success. Both were wrong, and together
+// they hid a real double release.
+//
+// # Why the assertion is on the release COUNT
+//
+// buf.Buffer.Release() is idempotent from the outside: it zeroes the struct and clears its managed
+// flag, so a second call is a silent no-op and `cached.Len() == 0` holds either way. Asserting on
+// Len would therefore pass with the bug present. The count is the ownership record.
 func TestWriteOwnedBufferOwnershipOnError(t *testing.T) {
 	t.Parallel()
 
@@ -200,10 +239,12 @@ func TestWriteOwnedBufferOwnershipOnError(t *testing.T) {
 
 	err, handedOver := WriteOwnedBuffer(fullGeometry{destination}, cached)
 	require.Error(t, err, "the writer's error must be reported")
-	require.False(t, handedOver, "a FAILED WriteBuffer must not report a hand-off, or the caller leaks")
-
-	cached.Release()
-	require.Zero(t, cached.Len(), "the caller's release must return the buffer to the pool")
+	require.True(t, handedOver,
+		"a FAILED WriteBuffer still transfers ownership: the writer releases with a defer, so the "+
+			"caller must not release or the pool array is handed out twice")
+	require.Equal(t, 1, destination.releaseCount(),
+		"the writer must have released exactly once")
+	require.Zero(t, cached.Len(), "the writer's deferred release cleared the buffer")
 }
 
 // TestWriteOwnedBufferWithNoAdvertisedGeometry proves a buffer-taking writer that advertises nothing
