@@ -39,8 +39,11 @@ func CopyWithIncreateBuffer(destination io.Writer, source io.Reader, increaseBuf
 			cachedBuffer := cachedSrc.ReadCached()
 			if cachedBuffer != nil {
 				dataLen := cachedBuffer.Len()
-				_, err = destination.Write(cachedBuffer.Bytes())
-				cachedBuffer.Release()
+				var handedOver bool
+				err, handedOver = WriteOwnedBuffer(destination, cachedBuffer)
+				if !handedOver {
+					cachedBuffer.Release()
+				}
 				if err != nil {
 					return
 				}
@@ -535,4 +538,74 @@ func CopyPacketConn(ctx context.Context, source N.PacketConn, destination N.Pack
 	})
 	group.FastFail()
 	return group.Run(ctx)
+}
+
+// WriteOwnedBuffer delivers a pooled buffer to destination, transferring ownership when the
+// destination can take it.
+//
+// It reports whether the destination CONSUMED the buffer.
+//
+// # Why this exists
+//
+// A cached/sniffed first payload is held in a *buf.Buffer that already carries exactly the geometry
+// a framing writer needs: front headroom for its header, rear headroom for its padding or trailer,
+// and a bounded length. Writing it with the plain io.Writer path throws all of that away -- the
+// writer receives a bare byte slice and, if it frames in place, must allocate a second buffer and
+// copy the payload into it. That is one full payload copy on the first bytes of every connection
+// that uses sniffing, which is also where the latency is most visible.
+//
+// # The decision is the destination's, not the protocol's
+//
+// The check is on the writer's OWN advertised geometry. There is deliberately no protocol name, no
+// type switch on a proxy implementation and no configuration flag:
+//
+//	it must accept buffers          (N.ExtendedWriter)
+//	the payload must fit its MTU    (N.WriterWithMTU)
+//	the buffer must have its headroom (N.FrontHeadroom, N.RearHeadroom)
+//
+// Any writer meeting those can be handed the buffer whatever protocol it speaks; any writer that
+// does not keeps the previous path, so this cannot change behaviour for a writer that never opted
+// in.
+//
+// Nothing is resized or relocated to force a fit. Moving the payload to gain headroom would be the
+// very copy the fast path exists to avoid, so an incompatible buffer falls back instead.
+//
+// # Ownership
+//
+// On success the writer consumes the buffer, matching N.ExtendedWriter.WriteBuffer's contract
+// elsewhere in this package -- the copy loops call it and do not release. The bool exists so the
+// caller knows NOT to release, rather than relying on a Release being harmless. On failure the
+// buffer is untouched and still the caller's.
+func WriteOwnedBuffer(destination io.Writer, buffer *buf.Buffer) (error, bool) {
+	writer := N.UnwrapWriter(destination)
+	extendedWriter, isExtendedWriter := writer.(N.ExtendedWriter)
+	if !isExtendedWriter {
+		_, err := destination.Write(buffer.Bytes())
+		return err, false
+	}
+	// A writer that advertises no MTU or headroom has nothing to violate, so the corresponding
+	// check is vacuous -- the same reading CalculateMTU applies to a plain net.Conn.
+	if withMTU, hasMTU := writer.(N.WriterWithMTU); hasMTU {
+		if buffer.Len() > withMTU.WriterMTU() {
+			_, err := destination.Write(buffer.Bytes())
+			return err, false
+		}
+	}
+	if withFrontHeadroom, hasFrontHeadroom := writer.(N.FrontHeadroom); hasFrontHeadroom {
+		if buffer.Start() < withFrontHeadroom.FrontHeadroom() {
+			_, err := destination.Write(buffer.Bytes())
+			return err, false
+		}
+	}
+	if withRearHeadroom, hasRearHeadroom := writer.(N.RearHeadroom); hasRearHeadroom {
+		if buffer.FreeLen() < withRearHeadroom.RearHeadroom() {
+			_, err := destination.Write(buffer.Bytes())
+			return err, false
+		}
+	}
+	err := extendedWriter.WriteBuffer(buffer)
+	if err != nil {
+		return err, false
+	}
+	return nil, true
 }
