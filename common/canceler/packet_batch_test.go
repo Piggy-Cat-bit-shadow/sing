@@ -885,9 +885,12 @@ func TestConcurrentBatchReadAndWrite(t *testing.T) {
 // TestBatchBuffersAreNotDoubleReleased proves the wrapper does not release buffers the
 // inner writer already consumed.
 //
-// The failure this guards against is a double release, which corrupts the pool and shows
-// up later as unrelated corruption rather than as a clean test failure. Pool double
-// release panics in this library, so simply completing the call is the assertion.
+// The failure this guards against is an ownership-contract violation: a redundant release
+// of a buffer whose ownership already moved. Under the current Buffer.Release, the second
+// call is absorbed once the buffer is no longer managed, so it is runtime-invisible rather
+// than an allocator-level double free. This test therefore cannot observe the violation
+// through the allocator; it pins the wrapper's call sequence so the contract cannot drift
+// silently.
 func TestBatchBuffersAreNotDoubleReleased(t *testing.T) {
 	for _, testCase := range []struct {
 		name string

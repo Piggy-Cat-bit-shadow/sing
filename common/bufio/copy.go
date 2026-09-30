@@ -572,7 +572,9 @@ func CopyPacketConn(ctx context.Context, source N.PacketConn, destination N.Pack
 //
 // # Ownership
 //
-// Ownership transfers the moment WriteBuffer is ENTERED, and the ERROR RESULT DOES NOT CHANGE THAT.
+// Ownership transfers when WriteBuffer is INVOKED. The caller must not release the buffer after that
+// point, REGARDLESS OF THE WriteBuffer ERROR RESULT.
+//
 // Every N.ExtendedWriter releases the buffer itself, with a `defer`:
 //
 //	ExtendedWriterWrapper.WriteBuffer:  defer buffer.Release(); return common.Error(w.Write(...))
@@ -584,11 +586,15 @@ func CopyPacketConn(ctx context.Context, source N.PacketConn, destination N.Pack
 // # Why the error return must NOT return false
 //
 // An earlier revision returned `err, false` when WriteBuffer failed, on the reasoning that a failed
-// write had not consumed the buffer. That is wrong: it makes the caller release a buffer the writer
-// already released. The second release is not a benign double free -- buf.Buffer.Release() zeroes
-// the struct and returns the backing array to the pool, so the caller's call is a silent no-op on an
-// already-cleared struct while the ARRAY has already been handed to whoever allocates next. The
-// corruption shows up later, in unrelated traffic, rather than here.
+// write had not consumed the buffer. That is wrong: it makes the caller attempt a SECOND release of
+// a buffer the writer has already released. That is an ownership-contract violation on the caller's
+// side.
+//
+// The current Buffer.Release implementation makes that redundant second Release a no-op: the first
+// release clears the managed state, and Release returns early once the buffer is no longer managed,
+// so no second Put occurs. The violation is therefore runtime-invisible today rather than an
+// allocator-level double free -- but callers must NOT depend on that implementation detail. Correct
+// ownership must not rely on Release being idempotent.
 //
 // The failure paths ABOVE this point (no ExtendedWriter, MTU, headroom) return false correctly:
 // they never enter WriteBuffer, so they never transfer ownership.

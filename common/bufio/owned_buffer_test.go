@@ -56,8 +56,8 @@ func (d *geometryDestination) writeBuffer(buffer *buf.Buffer) error {
 	//	ChunkWriter.WriteBuffer:           defer buffer.Release() on the oversized branch
 	//
 	// An earlier version of this fixture released only on the SUCCESS path. That modelled a
-	// contract no writer has, and it is why WriteOwnedBuffer's double release went unnoticed: the
-	// test asserted the wrong behaviour and the fixture quietly agreed.
+	// contract no writer has, and it is why WriteOwnedBuffer's redundant caller-side release went
+	// unnoticed: the test asserted the wrong behaviour and the fixture quietly agreed.
 	defer func() {
 		d.access.Lock()
 		d.releases++
@@ -225,7 +225,11 @@ func TestWriteOwnedBufferWithoutExtendedWriter(t *testing.T) {
 //
 // The previous version asserted the opposite -- that a failed WriteBuffer leaves the buffer with the
 // caller -- and the fixture cooperated by releasing only on success. Both were wrong, and together
-// they hid a real double release.
+// they hid an ownership-contract violation: a caller-side Release after ownership had already moved.
+//
+// That violation is runtime-INVISIBLE under the current Release implementation, which absorbs a
+// redundant second Release once the buffer is no longer managed. It is still a contract violation,
+// and correct ownership must not depend on Release being idempotent.
 //
 // # Why the assertion is on the release COUNT
 //
@@ -245,7 +249,8 @@ func TestWriteOwnedBufferOwnershipOnError(t *testing.T) {
 	require.Error(t, err, "the writer's error must be reported")
 	require.True(t, handedOver,
 		"a FAILED WriteBuffer still transfers ownership: the writer releases with a defer, so the "+
-			"caller must not release or the pool array is handed out twice")
+			"caller must not release again -- that is an ownership-contract violation, even though "+
+			"the current Release implementation absorbs the redundant call")
 	require.Equal(t, 1, destination.releaseCount(),
 		"the writer must have released exactly once")
 	require.Zero(t, cached.Len(), "the writer's deferred release cleared the buffer")
@@ -343,7 +348,9 @@ func TestWriteOwnedBufferBothPathsCarryTheSameBytes(t *testing.T) {
 // # Why this matters here specifically
 //
 // This was verified by mutation rather than assumed: replacing the guard with an unconditional
-// Release leaves the whole common/bufio suite GREEN. That mutation is a real double release, so the
+// Release leaves the whole common/bufio suite GREEN. That mutation is an ownership-contract
+// violation -- a redundant caller-side Release after ownership transfer -- and it is
+// runtime-invisible only because the current Release implementation absorbs the second call. The
 // suite would have shipped it. This test is what catches it.
 func TestCachedHandoverCallerConsultsTheOwnershipFlag(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
@@ -367,10 +374,11 @@ func TestCachedHandoverCallerConsultsTheOwnershipFlag(t *testing.T) {
 		"the caller must consult the ownership flag: it is the ONLY signal for whether the writer "+
 			"already released the buffer")
 	require.Contains(t, block, "if !handedOver",
-		"the release must be guarded by the ownership flag. An unconditional Release is a double "+
-			"release whenever the writer took the buffer -- including every FAILED WriteBuffer, "+
-			"because writers release with a defer. That double release is invisible at runtime, "+
-			"which is why this is checked at the source level")
+		"the release must be guarded by the ownership flag. An unconditional Release is a "+
+			"redundant caller-side Release whenever the writer took the buffer -- including every "+
+			"FAILED WriteBuffer, because writers release with a defer. That is an ownership-contract "+
+			"violation, and it is runtime-invisible because the current Release implementation "+
+			"absorbs the second call, which is why this is checked at the source level")
 	require.NotContains(t, block, "_ = handedOver",
 		"the ownership flag must not be discarded")
 }
