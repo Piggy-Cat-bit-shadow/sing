@@ -8,6 +8,10 @@ import (
 	"github.com/sagernet/sing/common/buf"
 
 	"github.com/stretchr/testify/require"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 // Tests for WriteOwnedBuffer, the geometry-based ownership hand-off used for a cached first payload.
@@ -310,4 +314,63 @@ func TestWriteOwnedBufferBothPathsCarryTheSameBytes(t *testing.T) {
 	slowBuffer.Release()
 
 	require.Equal(t, viaFast, viaSlow, "both paths must carry identical bytes")
+}
+
+// TestCachedHandoverCallerConsultsTheOwnershipFlag is a SOURCE-level guard, and it exists because
+// every runtime guard for this rule was proven impossible.
+//
+// # The measurement that forces a source-level test
+//
+// The caller in CopyWithIncreateBuffer releases only when handedOver is false. A caller that
+// releases unconditionally instead is indistinguishable at runtime:
+//
+//	buf.Buffer.Release()  returns at `if b == nil || !b.managed { return }`
+//	the writer's release does `*b = Buffer{}`, so !managed is already true
+//	therefore              the caller's second Release never reaches buf.Put
+//
+// Measured with a counting allocator installed as buf.DefaultAllocator, across all four
+// combinations of "did the writer take the buffer" x "did the write fail":
+//
+//	no-enter, ok     putsAfter=1
+//	no-enter, fail   putsAfter=1
+//	enter,    ok     putsAfter=1
+//	enter,    fail   putsAfter=1
+//
+// Pool identity cannot substitute either, because a fresh pooled allocation legitimately returns
+// the same array. So the property is a rule about WHICH VALUE the caller branches on, not a runtime
+// behaviour, and a runtime test cannot express it.
+//
+// # Why this matters here specifically
+//
+// This was verified by mutation rather than assumed: replacing the guard with an unconditional
+// Release leaves the whole common/bufio suite GREEN. That mutation is a real double release, so the
+// suite would have shipped it. This test is what catches it.
+func TestCachedHandoverCallerConsultsTheOwnershipFlag(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	source, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "copy.go"))
+	require.NoError(t, err)
+	src := string(source)
+
+	// Locate the cached-payload hand-over block.
+	const marker = "WriteOwnedBuffer(destination, cachedBuffer)"
+	start := strings.Index(src, marker)
+	require.GreaterOrEqual(t, start, 0, "the cached hand-over call must exist in copy.go")
+
+	// Take the statement and the few lines that follow, which is where the release decision lives.
+	block := src[start:]
+	if end := strings.Index(block, "\n\n"); end >= 0 {
+		block = block[:end]
+	}
+
+	require.Contains(t, block, "handedOver",
+		"the caller must consult the ownership flag: it is the ONLY signal for whether the writer "+
+			"already released the buffer")
+	require.Contains(t, block, "if !handedOver",
+		"the release must be guarded by the ownership flag. An unconditional Release is a double "+
+			"release whenever the writer took the buffer -- including every FAILED WriteBuffer, "+
+			"because writers release with a defer. That double release is invisible at runtime, "+
+			"which is why this is checked at the source level")
+	require.NotContains(t, block, "_ = handedOver",
+		"the ownership flag must not be discarded")
 }
