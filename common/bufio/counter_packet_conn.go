@@ -83,7 +83,11 @@ type counterPacketBatchWriter struct {
 }
 
 func (w *counterPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
-	dataLens := make([]int64, len(buffers))
+	// Scratch, not a heap slice: this runs once per batch on the UDP fast path and the
+	// slice is only read immediately below. A batch larger than the scratch falls back
+	// to the heap rather than overrunning.
+	var scratch batchScratch
+	dataLens := scratch.int64s(len(buffers))
 	for index, buffer := range buffers {
 		dataLens[index] = int64(buffer.Len())
 	}
@@ -115,7 +119,9 @@ type counterConnectedPacketBatchWriter struct {
 }
 
 func (w *counterConnectedPacketBatchWriter) WriteConnectedPacketBatch(buffers []*buf.Buffer) error {
-	dataLens := make([]int64, len(buffers))
+	// See counterPacketBatchWriter: per-batch scratch with a heap fallback.
+	var scratch batchScratch
+	dataLens := scratch.int64s(len(buffers))
 	for index, buffer := range buffers {
 		dataLens[index] = int64(buffer.Len())
 	}

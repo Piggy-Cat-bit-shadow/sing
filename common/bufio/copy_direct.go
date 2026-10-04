@@ -128,7 +128,76 @@ func copyPacketWaitWithPool(session *packetCopySession, destinationConn N.Packet
 	}
 }
 
+// batchScratch provides the per-batch scratch arrays the packet batch copy loops
+// need, without a heap allocation in the common case.
+//
+// # Why this exists
+//
+// Every batch copy iteration previously allocated its own slice:
+//
+//	dataLens := make([]int, len(buffers))
+//
+// With DefaultPacketReadBatchSize at 64 and a batch per iteration, that is one
+// allocation per batch on the hottest UDP path in the process - the one that carries
+// game, VoIP and QUIC traffic. The arrays are pure scratch: they are filled, read once,
+// and never leave the iteration.
+//
+// # Why a stack array is safe here
+//
+// The returned slices do not escape beyond the copy loop. The caller fills them, passes
+// them to WritePacketBatch / TransferBatch, and the iteration ends. Neither callee
+// retains the slice: TransferBatch only iterates it, and the batch writers only read it
+// for the duration of the syscall. So the arrays need only outlive the loop, which a
+// function-local value does - and escape analysis confirms it stays on the stack.
+//
+// The scratch is declared ONCE per copy loop, not inside the batch loop. The struct is
+// ~4.8 KiB; allocating it per iteration would cost more than the small slices it
+// replaces. Each copy loop runs on a single goroutine for its session, so a
+// function-local scratch is not shared and needs no synchronisation.
+//
+// # The fallback
+//
+// Batch size is a read-wait option, not a constant: a caller may ask for more than
+// DefaultPacketReadBatchSize. Taking the stack array as a fixed ceiling and indexing
+// past it would be a buffer overrun, so an oversized batch falls back to the heap. The
+// fast path is the one that matters; correctness is kept for the rest.
+type batchScratch struct {
+	lensInt   [DefaultPacketReadBatchSize]int
+	lensInt64 [DefaultPacketReadBatchSize]int64
+	dest      [DefaultPacketReadBatchSize]M.Socksaddr
+}
+
+// ints returns a length-n int slice backed by the scratch when it fits, else a fresh one.
+func (s *batchScratch) ints(n int) []int {
+	if n <= len(s.lensInt) {
+		return s.lensInt[:n]
+	}
+	return make([]int, n)
+}
+
+// int64s returns a length-n int64 slice backed by the scratch when it fits, else a fresh one.
+func (s *batchScratch) int64s(n int) []int64 {
+	if n <= len(s.lensInt64) {
+		return s.lensInt64[:n]
+	}
+	return make([]int64, n)
+}
+
+// destinations returns a length-n Socksaddr slice backed by the scratch when it fits,
+// else a fresh one.
+func (s *batchScratch) destinations(n int) []M.Socksaddr {
+	if n <= len(s.dest) {
+		return s.dest[:n]
+	}
+	return make([]M.Socksaddr, n)
+}
+
 func copyPacketBatchWaitWithPool(session *packetCopySession, destinationConn N.PacketBatchWriter, source N.PacketBatchReadWaiter, notFirstTime bool) (handled bool, n int64, err error) {
+	// Declared once per copy loop, NOT per batch. The struct is ~4.8 KiB, so
+	// allocating it inside the loop would cost more than the small slices it
+	// replaces. Each copy loop runs on one goroutine per session, so a function-local
+	// scratch is not shared and needs no lock.
+	var scratch batchScratch
 	handled = true
 	for {
 		var (
@@ -139,7 +208,7 @@ func copyPacketBatchWaitWithPool(session *packetCopySession, destinationConn N.P
 		if err != nil {
 			return handled, n, err
 		}
-		dataLens := make([]int, len(buffers))
+		dataLens := scratch.ints(len(buffers))
 		for index, buffer := range buffers {
 			dataLens[index] = buffer.Len()
 		}
@@ -164,6 +233,11 @@ func copyPacketBatchWaitWithPool(session *packetCopySession, destinationConn N.P
 }
 
 func copyPacketBatchToConnectedWaitWithPool(session *packetCopySession, destinationConn N.ConnectedPacketBatchWriter, source N.PacketBatchReadWaiter, notFirstTime bool) (handled bool, n int64, err error) {
+	// Declared once per copy loop, NOT per batch. The struct is ~4.8 KiB, so
+	// allocating it inside the loop would cost more than the small slices it
+	// replaces. Each copy loop runs on one goroutine per session, so a function-local
+	// scratch is not shared and needs no lock.
+	var scratch batchScratch
 	handled = true
 	for {
 		var buffers []*buf.Buffer
@@ -171,7 +245,7 @@ func copyPacketBatchToConnectedWaitWithPool(session *packetCopySession, destinat
 		if err != nil {
 			return handled, n, err
 		}
-		dataLens := make([]int, len(buffers))
+		dataLens := scratch.ints(len(buffers))
 		for index, buffer := range buffers {
 			dataLens[index] = buffer.Len()
 		}
@@ -196,6 +270,11 @@ func copyPacketBatchToConnectedWaitWithPool(session *packetCopySession, destinat
 }
 
 func copyConnectedPacketBatchWaitWithPool(session *packetCopySession, destinationConn N.PacketBatchWriter, source N.ConnectedPacketBatchReadWaiter, notFirstTime bool) (handled bool, n int64, err error) {
+	// Declared once per copy loop, NOT per batch. The struct is ~4.8 KiB, so
+	// allocating it inside the loop would cost more than the small slices it
+	// replaces. Each copy loop runs on one goroutine per session, so a function-local
+	// scratch is not shared and needs no lock.
+	var scratch batchScratch
 	handled = true
 	for {
 		var (
@@ -206,8 +285,8 @@ func copyConnectedPacketBatchWaitWithPool(session *packetCopySession, destinatio
 		if err != nil {
 			return handled, n, err
 		}
-		destinations := make([]M.Socksaddr, len(buffers))
-		dataLens := make([]int, len(buffers))
+		destinations := scratch.destinations(len(buffers))
+		dataLens := scratch.ints(len(buffers))
 		for index, buffer := range buffers {
 			destinations[index] = destination
 			dataLens[index] = buffer.Len()
@@ -233,6 +312,11 @@ func copyConnectedPacketBatchWaitWithPool(session *packetCopySession, destinatio
 }
 
 func copyConnectedPacketBatchToConnectedWaitWithPool(session *packetCopySession, destinationConn N.ConnectedPacketBatchWriter, source N.ConnectedPacketBatchReadWaiter, notFirstTime bool) (handled bool, n int64, err error) {
+	// Declared once per copy loop, NOT per batch. The struct is ~4.8 KiB, so
+	// allocating it inside the loop would cost more than the small slices it
+	// replaces. Each copy loop runs on one goroutine per session, so a function-local
+	// scratch is not shared and needs no lock.
+	var scratch batchScratch
 	handled = true
 	for {
 		var buffers []*buf.Buffer
@@ -240,7 +324,7 @@ func copyConnectedPacketBatchToConnectedWaitWithPool(session *packetCopySession,
 		if err != nil {
 			return handled, n, err
 		}
-		dataLens := make([]int, len(buffers))
+		dataLens := scratch.ints(len(buffers))
 		for index, buffer := range buffers {
 			dataLens[index] = buffer.Len()
 		}
