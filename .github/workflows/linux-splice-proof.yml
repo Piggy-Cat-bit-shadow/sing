@@ -187,6 +187,9 @@ jobs:
         working-directory: sing-box
         run: |
           set -euo pipefail
+          # The module directory is empty until the module is in the cache: go list -m reads the
+          # requirement graph, it does not download. Without this the grep below reads /common/bufio.
+          go mod download github.com/sagernet/sing
           directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
           echo "resolved source: ${directory}"
           grep -n 'return false, 0, err' "${directory}/common/bufio/splice_linux.go"
@@ -211,6 +214,7 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq strace
           fi
+          go mod download github.com/sagernet/sing
           module_directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
           go test -count=1 -v -run '^TestPipe2SetupFailure' "${module_directory}/common/bufio"
           go test -c -o /tmp/pinned-bufio.test "${module_directory}/common/bufio"
