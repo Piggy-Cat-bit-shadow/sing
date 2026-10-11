@@ -29,6 +29,11 @@ on:
       - dev
   workflow_dispatch:
     inputs:
+      strace_only:
+        description: 'Run only the strace observation step (used by the mutation control that forces the userspace path). Any non-empty value enables it.'
+        required: false
+        default: ''
+        type: string
       sing_box_revision:
         description: 'Full commit SHA of Piggy-Cat-bit-shadow/sing-box to check the pin against. Empty skips the pinned-consumer job.'
         required: false
@@ -111,7 +116,15 @@ jobs:
           strace -V | head -n 1
           go test -c -o /tmp/bufio.test ./common/bufio
           strace -f -qq -e trace=splice -o /tmp/splice.trace \
-            /tmp/bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1
+            /tmp/bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1 2>&1 | tee /tmp/splice.test.log
+          # "no tests to run" would leave the trace empty and be reported as "the fast path did not
+          # run" - which is the right verdict for the wrong reason, and it happened on this workflow's
+          # first dev run, where the test does not exist yet. Name the missing test instead.
+          if grep -q 'no tests to run' /tmp/splice.test.log; then
+            echo "FAIL: TestActualLinuxSpliceCaseA does not exist at this revision, so the trace" >&2
+            echo "      proves nothing. The proof tests live on the branch that adds them." >&2
+            exit 1
+          fi
           echo "--- splice syscalls observed ---"
           grep -c 'splice(' /tmp/splice.trace || true
           grep 'splice(' /tmp/splice.trace | head -n 40
@@ -182,16 +195,29 @@ jobs:
         working-directory: sing-box
         run: |
           set -euo pipefail
-          directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
-          echo "resolved source: ${directory}"
-          grep -n 'return false, 0, err' "${directory}/common/bufio/splice_linux.go"
-          grep -n 'var splicePipe2 = unix.Pipe2' "${directory}/common/bufio/splice_linux.go"
-          grep -n 'unix.Splice(int(fd), nil' "${directory}/common/bufio/splice_linux.go"
-          if grep -q 'spliceCall' "${directory}/common/bufio/splice_linux.go"; then
+          # Resolve the pinned revision out of go.mod and build its module-cache path directly.
+          # "go list -m -f '{{.Dir}}'" is empty until the module has been fetched, and Go does not
+          # fetch it just because it was asked where it is - the first run of this check therefore
+          # grepped /common/bufio and failed for the wrong reason.
+          rule="$(grep -E '^replace github\.com/sagernet/sing =>' go.mod)"
+          echo "pin rule:  ${rule}"
+          version="${rule##* }"
+          echo "pinned at: ${version}"
+          module_directory="$(go env GOMODCACHE)/github.com/!piggy-!cat-bit-shadow/sing@${version}"
+          go mod download github.com/sagernet/sing
+          echo "resolved source: ${module_directory}"
+          test -f "${module_directory}/common/bufio/splice_linux.go" || {
+            echo "FAIL: the pinned module is not in the cache at ${module_directory}" >&2
+            exit 1
+          }
+          grep -n 'return false, 0, err' "${module_directory}/common/bufio/splice_linux.go"
+          grep -n 'var splicePipe2 = unix.Pipe2' "${module_directory}/common/bufio/splice_linux.go"
+          grep -n 'unix.Splice(int(fd), nil' "${module_directory}/common/bufio/splice_linux.go"
+          if grep -q 'spliceCall' "${module_directory}/common/bufio/splice_linux.go"; then
             echo "FAIL: the pinned source still routes the splice syscall through a mutable seam" >&2
             exit 1
           fi
-          test -f "${directory}/common/bufio/splice_actual_linux_test.go" || {
+          test -f "${module_directory}/common/bufio/splice_actual_linux_test.go" || {
             echo "FAIL: the pinned source does not carry the Linux proof tests" >&2
             exit 1
           }
@@ -206,6 +232,7 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq strace
           fi
+          go mod download github.com/sagernet/sing
           module_directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
           go test -count=1 -v -run '^TestPipe2SetupFailure' "${module_directory}/common/bufio"
           go test -c -o /tmp/pinned-bufio.test "${module_directory}/common/bufio"
