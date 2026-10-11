@@ -4,20 +4,20 @@ name: linux-splice-proof
 #
 # # Why this is its own workflow and not a line in test.yml
 #
-# test.yml builds the whole matrix (three operating systems, two Go versions) to answer "does
-# this compile and does the suite pass". The claim that needs a real kernel is narrower and
-# stronger: on Linux, a byte-exact TCP stream is moved by unix.Splice() and the syscall is
-# counted while it runs. That claim is decided by one package - common/bufio - and needs
-# nothing else, so a failure here cannot be buried in a six-cell matrix, and re-running it
-# does not cost a matrix rebuild.
+# test.yml builds the whole matrix (three operating systems, two Go versions) to answer "does this
+# compile and does the suite pass". The claim that needs a real kernel is narrower and stronger: on
+# Linux, a byte-exact TCP stream is moved by unix.Splice(), and that syscall is observed running.
+# That claim is decided by one package - common/bufio - and needs nothing else, so a failure here
+# cannot be buried in a six-cell matrix, and re-running it does not cost a matrix rebuild.
 #
-# # What makes this evidence rather than decoration
+# # How the syscall claim is made
 #
-# The tests it runs fail if the splice syscall does not execute (the counter is asserted), if
-# the payload is not byte-exact, if a Pipe2 setup failure suppresses the userspace fallback,
-# or if a mid-stream failure stops reporting the handover. It is dispatched by hand
-# (workflow_dispatch) as well as on push, so the run that a review reads is a run someone
-# asked for, at a revision that can be named.
+# Not by counting calls through a hook in the production code: a mutable function value in place of
+# the real syscall changes the thing being measured, and the trace would then be of the hook rather
+# than of the engine. The test binary is traced with strace instead, and the trace is required to
+# contain a splice( line. If the engine fell back to the userspace copy - because the topology ran
+# the payload past it, or because a capability regressed - there would be no splice syscall at all
+# and this step fails.
 on:
   push:
     branches:
@@ -28,6 +28,17 @@ on:
       - main
       - dev
   workflow_dispatch:
+    inputs:
+      strace_only:
+        description: 'Run only the strace observation step (used by the mutation control that forces the userspace path). Any non-empty value enables it.'
+        required: false
+        default: ''
+        type: string
+      sing_box_revision:
+        description: 'Full commit SHA of Piggy-Cat-bit-shadow/sing-box to check the pin against. Empty skips the pinned-consumer job.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -36,7 +47,7 @@ jobs:
   linux-splice-proof:
     name: unix.Splice runtime proof (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,11 +58,10 @@ jobs:
         # The evidence is only as good as the revision, and a branch name is not a revision.
         run: |
           set -euo pipefail
-          echo "ref:        ${{ github.ref }}"
-          echo "event:      ${{ github.event_name }}"
-          echo "sha:        $(git rev-parse HEAD)"
-          echo "go version: $(go version 2>/dev/null || echo 'installed below')"
-          echo "kernel:     $(uname -srm)"
+          echo "ref:     ${{ github.ref }}"
+          echo "event:   ${{ github.event_name }}"
+          echo "sha:     $(git rev-parse HEAD)"
+          echo "kernel:  $(uname -srm)"
           uname -a
 
       - name: Setup Go
@@ -71,22 +81,151 @@ jobs:
           fi
           echo "PASS: gofmt clean"
 
-      - name: splice engine unit tests (Linux)
-        run: go test -count=1 -v ./common/bufio/...
-
-      - name: unix.Splice runtime proof (Linux, real TCP sockets)
-        # The named cases, run explicitly so the log states what was proved rather than
-        # leaving it to be inferred from a package-level PASS.
+      - name: the Pipe2 fallback regression, on its own
+        # First, and by itself, because it is the one assertion that must not be skipped by an
+        # earlier failure and because a broken fallback is the bug this work exists for.
         run: |
           set -euo pipefail
-          go test -count=1 -v -run 'TestActualLinuxSplice' ./common/bufio/
-          echo "PASS: unix.Splice() executed on real TCP sockets"
+          go test -count=1 -v -run '^TestPipe2SetupFailure' ./common/bufio/
+          echo "PASS: a Pipe2 setup failure falls back and still delivers the payload"
 
-      - name: unix.Splice runtime proof under -race
-        # The seam in splice_linux.go is a package-level function value, so this is what
-        # proves the counting wrapper is not itself a data race - in this package and in
-        # every other test that shares the package.
+      - name: the single spliced transfer, on its own
+        # A whole-package run is the last step, not the first: a regression in one integration test
+        # would otherwise spend the job's deadline before naming itself.
         run: |
           set -euo pipefail
-          go test -race -count=1 -run 'TestActualLinuxSplice|TestSplice' ./common/bufio/
+          go test -count=1 -v -run '^TestActualLinuxSpliceCaseA$' ./common/bufio/
+          echo "PASS: one TCP stream crossed the production copy path byte-exact"
+
+      - name: every splice runtime case
+        run: |
+          set -euo pipefail
+          go test -count=1 -v -run '^TestActualLinuxSplice' ./common/bufio/
+
+      - name: unix.Splice() observed by strace
+        # The kernel-level claim, made at the kernel boundary. The engine is traced while the
+        # 1 MiB case runs; the trace must contain a splice syscall, and the arguments are printed so
+        # the two directions are visible (socket -> pipe, then pipe -> socket).
+        run: |
+          set -euo pipefail
+          if ! command -v strace >/dev/null 2>&1; then
+            echo "strace is not installed on the runner; installing it, because the syscall claim depends on it"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq strace
+          fi
+          strace -V | head -n 1
+          go test -c -o /tmp/bufio.test ./common/bufio
+          strace -f -qq -e trace=splice -o /tmp/splice.trace \
+            /tmp/bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1
+          echo "--- splice syscalls observed ---"
+          grep -c 'splice(' /tmp/splice.trace || true
+          grep 'splice(' /tmp/splice.trace | head -n 40
+          grep -q 'splice(' /tmp/splice.trace || {
+            echo "FAIL: no splice() syscall was traced. The payload reached the consumer without the" >&2
+            echo "      kernel splice path - either the topology is wrong or the fast path did not run." >&2
+            exit 1
+          }
+          echo "PASS: unix.Splice() ran on this kernel"
+
+      - name: the whole package, the way CI runs it
+        run: |
+          set -euo pipefail
+          go test -count=1 ./common/bufio/...
+          echo "PASS: common/bufio is green"
+
+      - name: the splice tests under -race
+        # The pipe seam and the socket deadlines are the shared state here, so this is what proves
+        # the tests themselves are race-clean while the rest of the package runs alongside them.
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -run 'TestActualLinuxSplice|TestPipe2|TestSplice' ./common/bufio/
           echo "PASS: splice tests are race-clean"
+
+  pinned-sing-box-proof:
+    # The second half of the question, and the one a review actually asks: the fork is fixed, but is
+    # the PRODUCT built from the fixed revision? A fork commit that nobody pins is a fix that did not
+    # take effect.
+    name: pinned sing-box consumes this revision (Linux)
+    if: ${{ inputs.sing_box_revision != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout the consuming repository
+        uses: actions/checkout@v4
+        with:
+          repository: Piggy-Cat-bit-shadow/sing-box
+          ref: ${{ inputs.sing_box_revision }}
+          path: sing-box
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sing-box/go.mod
+          cache: true
+
+      - name: The pin is the revision this workflow proved
+        # Read back from the module file rather than trusted from the description, so a report cannot
+        # claim a pin it does not have.
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          pin="$(grep -E '^replace github\.com/sagernet/sing =>' go.mod)"
+          echo "consuming revision: $(git rev-parse HEAD)"
+          echo "pin line:           ${pin}"
+          echo "${pin}" | grep -q 'Piggy-Cat-bit-shadow/sing' || {
+            echo "FAIL: the consuming repository does not pin the fork at all" >&2
+            exit 1
+          }
+          go list -m github.com/sagernet/sing
+          echo "PASS: the pin resolves"
+
+      - name: the pinned source really carries the fix
+        # The pin resolving is not the same as the pin's CONTENT being the fix. This reads the source
+        # back out of the module cache and checks for the two things the commit is: handed cleared
+        # before the setup failure returns, and the direct splice syscall (no observation seam).
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
+          echo "resolved source: ${directory}"
+          grep -n 'return false, 0, err' "${directory}/common/bufio/splice_linux.go"
+          grep -n 'var splicePipe2 = unix.Pipe2' "${directory}/common/bufio/splice_linux.go"
+          grep -n 'unix.Splice(int(fd), nil' "${directory}/common/bufio/splice_linux.go"
+          if grep -q 'spliceCall' "${directory}/common/bufio/splice_linux.go"; then
+            echo "FAIL: the pinned source still routes the splice syscall through a mutable seam" >&2
+            exit 1
+          fi
+          test -f "${directory}/common/bufio/splice_actual_linux_test.go" || {
+            echo "FAIL: the pinned source does not carry the Linux proof tests" >&2
+            exit 1
+          }
+          echo "PASS: the pinned source is the fixed source"
+
+      - name: the pinned fork proves the syscall on this kernel too
+        # Run the PINNED tests, not this checkout's: that is the revision the product builds.
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq strace
+          fi
+          module_directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
+          go test -count=1 -v -run '^TestPipe2SetupFailure' "${module_directory}/common/bufio"
+          go test -c -o /tmp/pinned-bufio.test "${module_directory}/common/bufio"
+          strace -f -qq -e trace=splice -o /tmp/pinned-splice.trace \
+            /tmp/pinned-bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1
+          grep 'splice(' /tmp/pinned-splice.trace | head -n 20
+          grep -q 'splice(' /tmp/pinned-splice.trace || {
+            echo "FAIL: the PINNED revision moved the payload without a splice syscall" >&2
+            exit 1
+          }
+          echo "PASS: the pinned revision splices on this kernel"
+
+      - name: route handover diagnostics (Linux)
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          go test -count=1 -v -run 'Splice|Handover' ./route/ 2>&1 | tail -n 40
+          echo "PASS: the handover diagnostics suite is green against the pinned fork"
