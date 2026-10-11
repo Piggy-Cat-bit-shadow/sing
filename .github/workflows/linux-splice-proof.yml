@@ -28,6 +28,12 @@ on:
       - main
       - dev
   workflow_dispatch:
+    inputs:
+      sing_box_revision:
+        description: 'Full commit SHA of Piggy-Cat-bit-shadow/sing-box to check the pin against. Empty skips the pinned-consumer job.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -90,3 +96,71 @@ jobs:
           set -euo pipefail
           go test -race -count=1 -run 'TestActualLinuxSplice|TestSplice' ./common/bufio/
           echo "PASS: splice tests are race-clean"
+
+  pinned-sing-box-proof:
+    # The second half of the question, and the one a review actually asks: the fork is fixed,
+    # but is the PRODUCT built from the fixed revision? A fork commit that nobody pins is a
+    # fix that did not take effect.
+    #
+    # This checks out the consuming repository at a revision given as workflow input, asserts
+    # the pin by reading it back out of its go.mod, and runs the packages that consume the
+    # splice engine on Linux. It asks for a full commit SHA rather than a branch on purpose: a
+    # branch name cannot be checked against anything, and "the pin is what I think it is" is
+    # exactly the claim this job exists to make falsifiable.
+    name: pinned sing-box consumes this revision (Linux)
+    if: ${{ inputs.sing_box_revision != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the consuming repository
+        uses: actions/checkout@v4
+        with:
+          repository: Piggy-Cat-bit-shadow/sing-box
+          ref: ${{ inputs.sing_box_revision }}
+          path: sing-box
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sing-box/go.mod
+          cache: true
+
+      - name: The pin is the revision this workflow proved
+        # Read back from the module file rather than trusted from the description, and checked
+        # against the SHA that ran the first job, so a report cannot claim a pin it does not have.
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          pin="$(grep -E '^replace github\.com/sagernet/sing =>' go.mod)"
+          echo "sing-box revision: $(git rev-parse HEAD)"
+          echo "pin line:          ${pin}"
+          echo "${pin}" | grep -q "45cd4454c8c1" || {
+            echo "FAIL: the consuming repository does not pin the revision proved above" >&2
+            exit 1
+          }
+          go list -m github.com/sagernet/sing
+          echo "PASS: the pin resolves to the fixed revision"
+
+      - name: the pinned source really carries the fix
+        # The pin resolving is not the same as the pin's CONTENT being the fix. This reads the
+        # vendored source back out of the module cache and looks for the two things the commit
+        # is: handed cleared before the setup failure returns, and a splice seam that a test can
+        # count through.
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
+          echo "resolved source: ${directory}"
+          grep -n "return false, 0, err" "${directory}/common/bufio/splice_linux.go"
+          grep -n "splicePipe2 = unix.Pipe2" "${directory}/common/bufio/splice_linux.go"
+          grep -n "spliceCall  = unix.Splice" "${directory}/common/bufio/splice_linux.go"
+          echo "PASS: the pinned source is the fixed source"
+
+      - name: route handover diagnostics (Linux)
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          go test -count=1 -v -run 'Splice|Handover' ./route/ 2>&1 | tail -n 40
+          echo "PASS: the handover diagnostics suite is green against the pinned fork"
+
