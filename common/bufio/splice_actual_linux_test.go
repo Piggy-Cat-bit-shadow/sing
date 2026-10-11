@@ -3,8 +3,11 @@ package bufio
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -368,8 +371,23 @@ func TestPipe2SeamIsTheRealPipe2(t *testing.T) {
 // falling back, because a fallback there would replay a stream whose state has advanced.
 //
 // This one drives copyDirect instead of Copy on purpose. The claim is about copyDirect's return
-// values - handed, n and err - which Copy consumes and does not expose; and the failure is injected
-// by making the destination unwritable, which is a real syscall failure rather than a seam.
+// values - handed, moved and err - which Copy consumes and does not expose; and the failure is a
+// real syscall result rather than a seam.
+//
+// # Why the source has a short read deadline
+//
+// The destination is deliberately unwritable, so the copy cannot make progress and the engine sits
+// in the poller. Two things can then end the call, and both are honest reports of the same fact:
+//
+//   - the write splice fails outright once the pipe has been filled and the destination refuses
+//     more, which is the failure this test is named for; or
+//   - the read splice finds the source drained and the poller waits until the socket deadline,
+//     which surfaces as i/o timeout.
+//
+// The deadline is therefore set short and the error is required to be ONE of those two, rather than
+// accepting any error. What is asserted either way is the part the contract is about: the handover
+// is claimed (handed), bytes have already moved (moved > 0, so a fallback would replay them), and
+// what landed is a prefix of what was sent.
 func TestActualLinuxSpliceMidStreamFailureIsReported(t *testing.T) {
 	spliceTestHookLock.Lock()
 	defer spliceTestHookLock.Unlock()
@@ -385,15 +403,19 @@ func TestActualLinuxSpliceMidStreamFailureIsReported(t *testing.T) {
 	require.Equal(t, len(payload), written)
 
 	// A destination that cannot accept the bytes: a tiny send buffer and nothing reading the far
-	// end, so the write splice exhausts the pipe and then fails. The failure happens after bytes
-	// have left the source, which is the situation the handed contract is about.
+	// end. The failure happens after bytes have left the source, which is the situation the handed
+	// contract is about.
 	require.NoError(t, proxyPair.client.SetWriteBuffer(1024))
+	require.NoError(t, producerPair.server.SetReadDeadline(time.Now().Add(5*time.Second)))
 
 	handed, moved, directErr := copyDirect(producerPair.server, proxyPair.client, nil, nil)
 	require.Error(t, directErr, "a copy that cannot make progress must report an error")
 	require.True(t, handed,
 		"a mid-stream failure must keep handed=true: the stream has advanced and the userspace copy must not replay it")
 	require.Positive(t, moved, "bytes had already moved, which is what makes a fallback unsafe here")
+	require.True(t,
+		errors.Is(directErr, os.ErrDeadlineExceeded) || strings.Contains(directErr.Error(), "splice write"),
+		"the failure must be the blocked write splice or the drain deadline, not something unrelated: %v", directErr)
 
 	// What the destination received must be a prefix of what was sent: a partial transfer is the
 	// honest outcome here, and duplication would mean the stream had been replayed.
