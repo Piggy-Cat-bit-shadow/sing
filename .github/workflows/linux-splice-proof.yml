@@ -189,17 +189,29 @@ jobs:
           set -euo pipefail
           # The module directory is empty until the module is in the cache: go list -m reads the
           # requirement graph, it does not download. Without this the grep below reads /common/bufio.
+          # Resolve the pinned revision out of go.mod and build its cache path directly.
+          # "go list -m -f '{{.Dir}}'" is empty until the module has been downloaded, and Go does
+          # not download it just because it was asked where it is, so the check below would read
+          # /common/bufio and fail for the wrong reason.
+          version="$(grep -E '^replace github\.com/sagernet/sing =>' go.mod | awk '{print $NF}')"
+          echo "pinned version: ${version}"
+          module_directory="$(go env GOMODCACHE)/github.com/!piggy-!cat-bit-shadow/sing@${version#*sing }"
+          module_directory="$(echo "$module_directory" | sed 's#/!piggy-!cat-bit-shadow/sing@v[^ ]* #/!piggy-!cat-bit-shadow/sing@#')"
           go mod download github.com/sagernet/sing
-          directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
+          echo "resolved source: ${module_directory}"
+          test -f "${module_directory}/common/bufio/splice_linux.go" || {
+            echo "FAIL: the pinned module is not in the cache at ${module_directory}" >&2
+            exit 1
+          }
           echo "resolved source: ${directory}"
-          grep -n 'return false, 0, err' "${directory}/common/bufio/splice_linux.go"
-          grep -n 'var splicePipe2 = unix.Pipe2' "${directory}/common/bufio/splice_linux.go"
-          grep -n 'unix.Splice(int(fd), nil' "${directory}/common/bufio/splice_linux.go"
-          if grep -q 'spliceCall' "${directory}/common/bufio/splice_linux.go"; then
+          grep -n 'return false, 0, err' "${module_directory}/common/bufio/splice_linux.go"
+          grep -n 'var splicePipe2 = unix.Pipe2' "${module_directory}/common/bufio/splice_linux.go"
+          grep -n 'unix.Splice(int(fd), nil' "${module_directory}/common/bufio/splice_linux.go"
+          if grep -q 'spliceCall' "${module_directory}/common/bufio/splice_linux.go"; then
             echo "FAIL: the pinned source still routes the splice syscall through a mutable seam" >&2
             exit 1
           fi
-          test -f "${directory}/common/bufio/splice_actual_linux_test.go" || {
+          test -f "${module_directory}/common/bufio/splice_actual_linux_test.go" || {
             echo "FAIL: the pinned source does not carry the Linux proof tests" >&2
             exit 1
           }
