@@ -1,0 +1,92 @@
+name: linux-splice-proof
+
+# Runs the runtime proof for the Linux splice engine on a real Linux kernel.
+#
+# # Why this is its own workflow and not a line in test.yml
+#
+# test.yml builds the whole matrix (three operating systems, two Go versions) to answer "does
+# this compile and does the suite pass". The claim that needs a real kernel is narrower and
+# stronger: on Linux, a byte-exact TCP stream is moved by unix.Splice() and the syscall is
+# counted while it runs. That claim is decided by one package - common/bufio - and needs
+# nothing else, so a failure here cannot be buried in a six-cell matrix, and re-running it
+# does not cost a matrix rebuild.
+#
+# # What makes this evidence rather than decoration
+#
+# The tests it runs fail if the splice syscall does not execute (the counter is asserted), if
+# the payload is not byte-exact, if a Pipe2 setup failure suppresses the userspace fallback,
+# or if a mid-stream failure stops reporting the handover. It is dispatched by hand
+# (workflow_dispatch) as well as on push, so the run that a review reads is a run someone
+# asked for, at a revision that can be named.
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-splice-proof:
+    name: unix.Splice runtime proof (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prove the revision under test
+        # The evidence is only as good as the revision, and a branch name is not a revision.
+        run: |
+          set -euo pipefail
+          echo "ref:        ${{ github.ref }}"
+          echo "event:      ${{ github.event_name }}"
+          echo "sha:        $(git rev-parse HEAD)"
+          echo "go version: $(go version 2>/dev/null || echo 'installed below')"
+          echo "kernel:     $(uname -srm)"
+          uname -a
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l common/bufio || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          echo "PASS: gofmt clean"
+
+      - name: splice engine unit tests (Linux)
+        run: go test -count=1 -v ./common/bufio/...
+
+      - name: unix.Splice runtime proof (Linux, real TCP sockets)
+        # The named cases, run explicitly so the log states what was proved rather than
+        # leaving it to be inferred from a package-level PASS.
+        run: |
+          set -euo pipefail
+          go test -count=1 -v -run 'TestActualLinuxSplice' ./common/bufio/
+          echo "PASS: unix.Splice() executed on real TCP sockets"
+
+      - name: unix.Splice runtime proof under -race
+        # The seam in splice_linux.go is a package-level function value, so this is what
+        # proves the counting wrapper is not itself a data race - in this package and in
+        # every other test that shares the package.
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -run 'TestActualLinuxSplice|TestSplice' ./common/bufio/
+          echo "PASS: splice tests are race-clean"
