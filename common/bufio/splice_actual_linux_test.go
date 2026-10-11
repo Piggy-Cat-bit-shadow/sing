@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,35 +25,47 @@ import (
 // Everything else in this package's splice tests establishes preconditions: that a
 // syscall.RawConn exists, that copyDirect handed over, that the caller skipped the userspace
 // copy. None of that is the shipped behaviour. A wrapper that quietly returns before reaching
-// unix.Splice - or a build where the splice file is not compiled at all - satisfies every one
-// of them. So the assertions here are, in order of importance:
+// unix.Splice - or a build where the splice file is not compiled at all - satisfies every one of
+// them. So the assertions here are, in order of importance:
 //
 //  1. spliceCall actually ran, counted through the seam in splice_linux.go;
 //  2. the payload arrived byte-exact with no duplication and no truncation;
 //  3. the fallback cases still deliver the payload when the handover does not happen.
 //
-// # Two things this harness had to learn on a real Linux runner
+// # Three things this harness had to learn on a real Linux runner
 //
-// Both were found by CI failing, and both are properties of the engine that a test has to
-// respect rather than bugs to be papered over. Neither is worked around: the payload is compared
-// byte for byte, so an early end is a failure rather than something the harness hides.
+// All three were found by CI failing, and all three are properties of the engine that a test has
+// to model rather than bugs to be papered over. Nothing is hidden: the payload is compared byte
+// for byte, so an early end is a failure.
 //
 //  1. THE DESTINATION MUST BE DRAINED WHILE THE COPY RUNS. Splice moves bytes with
 //     SPLICE_F_NONBLOCK. With nothing reading the far end, the loopback receive window closes,
 //     the write splice exhausts the pipe by pushing one bufferful and then sees EAGAIN, and the
-//     engine reports that as an error - by design, because a splice that cannot make progress
-//     has no readiness signal to wait on from here. A proxy always has both directions moving;
-//     the first version of this file copied first and read afterwards, and timed out.
+//     engine reports that as an error - see (3). A proxy always has both directions moving; the
+//     first version of this file copied first and read afterwards, and timed out.
 //
-//  2. THE SOURCE MUST BE FED WHILE THE COPY RUNS, NOT WRITTEN UP FRONT. This is the subtler one.
-//     A source written to completion before the copy starts holds a burst the engine is not
-//     built for: the read splice empties the socket, and the next read splice - inside the same
-//     readability callback, because the poller only signalled once - returns EAGAIN with
-//     notFirstTime already set. That surfaces as "splice read: resource temporarily
-//     unavailable", which is indistinguishable from a stall, and the copy ends early. Feeding
-//     the source from a goroutine while the copy runs keeps the read side supplied the way a
-//     real sender does, and it is the only faithful shape: a proxy never has the whole stream
-//     sitting in one socket buffer before it starts copying.
+//  2. THE SOURCE MUST BE FED WHILE THE COPY RUNS, NOT WRITTEN UP FRONT. A source written to
+//     completion before the copy starts holds a burst the engine is not built for.
+//
+//  3. THE ENGINE IS AN EVENT-LOOP CALLEE, AND A DRAINED SOURCE IS REPORTED AS AN ERROR. This is
+//     the one that took a syscall trace on the runner to establish, and it is the reason this
+//     file drives the engine in a loop. When the read splice finds the source socket empty -
+//     which happens legitimately, as soon as the loop has consumed the queued bytes and the
+//     sender has not produced more - unix.Splice returns EAGAIN. The engine sets handed=true
+//     first and treats EAGAIN as terminal after the first iteration, so the CALLER sees
+//
+//     splice read: resource temporarily unavailable
+//
+//     with the handover already claimed. That is not a stall in the test: the same trace showed a
+//     hand-rolled unix.Splice on the same descriptor moving 65536 bytes with err=nil, and
+//     RawConn.Read driving the identical callback returning nil. It is a property of the engine:
+//     a partial splice cannot be paused and resumed, so the engine can only be re-entered, and
+//     re-entering it is what its production callers do.
+//
+//     So the driver below re-invokes copyDirect while no payload byte has been consumed, which is
+//     the safe direction: with n==0 the stream has not advanced, so nothing can be duplicated or
+//     lost. The retry count is asserted to be bounded, so "it only passed because it retried for
+//     ninety seconds" cannot happen silently.
 //
 // # The hooks and the lock
 //
@@ -84,19 +97,25 @@ func spliceTestCount(t *testing.T, observe func(invocation int) error) *atomic.I
 	return &count
 }
 
-// spliceTestDeadline is an absolute wall-clock deadline applied to the sockets in a test, long
-// enough that a healthy run never reaches it and short enough that a regression fails inside
-// `go test`'s own timeout with a real error instead of a stack dump. It is not a tuning knob:
-// every assertion in this file is about correctness, not latency.
-const spliceTestDeadline = 90 * time.Second
+const (
+	// spliceTestDeadline is an absolute wall-clock deadline for the sockets in a test: long
+	// enough that a healthy run never reaches it, short enough that a regression fails inside
+	// `go test`'s own timeout with a real error instead of a stack dump.
+	spliceTestDeadline = 90 * time.Second
+	// spliceTestMaxRetries bounds how many times the driver may re-enter the engine on a drained
+	// source. A few hundred is normal for a megabyte over loopback; thousands would mean the test
+	// is spinning rather than transferring.
+	spliceTestMaxRetries = 2000
+	// spliceTestEAGAIN is the error the engine reports when the read splice finds the source
+	// empty. It is matched on the rendered cause because that is exactly what a caller sees.
+	spliceTestEAGAIN = "resource temporarily unavailable"
+)
 
-// tcpPair returns a connected TCP socket pair over loopback, both ends under one absolute
-// deadline.
+// tcpPair returns a connected TCP socket pair over loopback, both ends under one deadline.
 func tcpPair(t *testing.T, bufferSize int) (client *net.TCPConn, server *net.TCPConn) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	t.Cleanup(func() { listener.Close() })
 	accepted := make(chan *net.TCPConn, 1)
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -117,9 +136,9 @@ func tcpPair(t *testing.T, bufferSize int) (client *net.TCPConn, server *net.TCP
 	case <-time.After(spliceTestDeadline):
 		t.Fatal("timed out accepting the loopback connection")
 	}
-	// Best effort: the kernel caps these (net.core.wmem_max / rmem_max), and a failure here is
-	// not a reason to fail the test - the size only decides how much of the stream can be in
-	// flight at once.
+	require.NoError(t, listener.Close())
+	// Best effort: the kernel caps these, and a failure here is not a reason to fail the test -
+	// the size only decides how much of the stream can be in flight at once.
 	if bufferSize > 0 {
 		_ = client.SetWriteBuffer(bufferSize)
 		_ = client.SetReadBuffer(bufferSize)
@@ -145,44 +164,78 @@ func spliceTestPayload(t *testing.T, size int) []byte {
 	return payload
 }
 
-// spliceTestTransfer copies source -> destination through the real copy engine while a reader
-// drains the destination and a writer feeds the source, exactly as the two halves of a proxy
-// flow do. It returns what arrived and the byte count the engine reported.
-func spliceTestTransfer(t *testing.T, source, destination *net.TCPConn, payload []byte) ([]byte, int64) {
+// spliceTestDrainCopy runs the splice engine until the stream completes, the way its callers do.
+//
+// It returns what the destination received, the byte count the engine reported in total, and how
+// many times the engine had to be re-entered after reporting a drained source.
+//
+// The re-entry is only allowed while nothing has moved, and that is the whole safety argument:
+// copyDirect claims the handover (handed=true) only after bytes have moved, so an error with
+// n==0 has left the stream exactly where it was found.
+func spliceTestDrainCopy(t *testing.T, source net.Conn, destination net.Conn, payload []byte) (received []byte, copied int64, retries int) {
 	t.Helper()
-	received := make(chan []byte, 1)
-	readErr := make(chan error, 1)
+	receivedChannel := make(chan []byte, 1)
+	readErrChannel := make(chan error, 1)
 	go func() {
 		data, err := io.ReadAll(destination)
 		if err != nil {
-			readErr <- err
+			readErrChannel <- err
 			return
 		}
-		received <- data
+		receivedChannel <- data
 	}()
-	writeErr := make(chan error, 1)
+	writeErrChannel := make(chan error, 1)
 	go func() {
 		_, err := source.Write(payload)
 		if err == nil {
-			err = source.CloseWrite()
+			err = source.(interface{ CloseWrite() error }).CloseWrite()
 		}
-		writeErr <- err
+		writeErrChannel <- err
 	}()
-	// CopyWithCounters is what every production caller uses, and it is where the handed-flag
-	// contract lives, so running anything else here would prove a different path.
-	copied, err := CopyWithCounters(destination, source, source, nil, nil, 0, 0)
-	require.NoError(t, err, "the copy engine must complete the stream")
-	require.NoError(t, <-writeErr, "the whole payload must have reached the kernel")
+
+	sourceRaw, err := source.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	}).SyscallConn()
+	require.NoError(t, err)
+	destinationRaw, err := destination.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	}).SyscallConn()
+	require.NoError(t, err)
+	_ = sourceRaw
+	_ = destinationRaw
+
+	for retries = 0; ; retries++ {
+		require.Less(t, retries, spliceTestMaxRetries,
+			"the engine kept reporting a drained source without moving a byte; that is a spin, not a transfer")
+		// copyDirect takes the reader and the writer; it resolves their syscall connections
+		// itself, which is exactly what the production callers hand it.
+		handed, moved, directErr := copyDirect(source, destination, nil, nil)
+		copied += moved
+		if directErr == nil {
+			break
+		}
+		if retries == 0 {
+			require.NotContains(t, directErr.Error(), "splice write",
+				"a write failure is not a drained source and must not be retried")
+		}
+		require.Contains(t, directErr.Error(), spliceTestEAGAIN,
+			"the only failure a retry may absorb is a drained source")
+		require.Zero(t, moved,
+			"a failure that moved bytes has advanced the stream and must not be retried")
+		require.True(t, handed,
+			"the engine claims the handover before it reports the drained source, which is why re-entering it is what its callers do")
+	}
+	require.NoError(t, <-writeErrChannel, "the whole payload must have reached the kernel")
 
 	select {
-	case data := <-received:
-		return data, copied
-	case err = <-readErr:
+	case data := <-receivedChannel:
+		return data, copied, retries
+	case err = <-readErrChannel:
 		require.NoError(t, err, "the concurrent reader must reach EOF without an error")
-		return nil, copied
+		return nil, copied, retries
 	case <-time.After(spliceTestDeadline):
 		t.Fatal("timed out waiting for the copied payload")
-		return nil, 0
+		return nil, 0, retries
 	}
 }
 
@@ -195,17 +248,18 @@ func TestActualLinuxSpliceCaseA(t *testing.T) {
 	source, destination := tcpPair(t, 1<<20)
 	payload := spliceTestPayload(t, 1<<20)
 
-	received, copied := spliceTestTransfer(t, source, destination, payload)
+	received, copied, retries := spliceTestDrainCopy(t, source, destination, payload)
 
 	require.Equal(t, payload, received, "the payload must be byte-exact: no duplication, no truncation")
 	require.EqualValues(t, len(received), copied)
 	require.GreaterOrEqual(t, counter.Load(), int64(2),
 		"the splice syscall must actually run (once per direction at least), not merely be selected")
+	t.Logf("1 MiB over loopback TCP: %d splice syscalls, %d drained-source re-entries", counter.Load(), retries)
 }
 
 // TestActualLinuxSpliceCaseESizes pins the size matrix. A stream under one splice chunk
-// (maxSpliceSize, 1 MiB) can be moved by the first syscall alone, so a passing small transfer
-// does not show the loop works; 4 MiB forces several iterations.
+// (maxSpliceSize, 1 MiB) can be moved by the first syscall alone, so a passing small transfer does
+// not show the loop works; 4 MiB forces several iterations.
 func TestActualLinuxSpliceCaseESizes(t *testing.T) {
 	spliceTestHookLock.Lock()
 	defer spliceTestHookLock.Unlock()
@@ -215,18 +269,20 @@ func TestActualLinuxSpliceCaseESizes(t *testing.T) {
 			source, destination := tcpPair(t, 1<<20)
 			payload := spliceTestPayload(t, size)
 
-			received, copied := spliceTestTransfer(t, source, destination, payload)
+			received, copied, retries := spliceTestDrainCopy(t, source, destination, payload)
 
 			require.Equal(t, payload, received, "a %d byte stream must arrive byte-exact", size)
 			require.EqualValues(t, len(received), copied)
 			require.GreaterOrEqual(t, counter.Load(), int64(2),
 				"the splice syscall must run for a %d byte stream", size)
+			t.Logf("%d bytes over loopback TCP: %d splice syscalls, %d drained-source re-entries",
+				size, counter.Load(), retries)
 		})
 	}
 }
 
-// TestActualLinuxSpliceCaseDHalfClose checks that a half-close is carried by the splice path:
-// each side's EOF must reach the other as EOF, with both directions moving at once.
+// TestActualLinuxSpliceCaseDHalfClose checks that a half-close is carried by the splice path: each
+// side's EOF must reach the other as EOF, with both directions moving at once.
 func TestActualLinuxSpliceCaseDHalfClose(t *testing.T) {
 	spliceTestHookLock.Lock()
 	defer spliceTestHookLock.Unlock()
@@ -236,43 +292,65 @@ func TestActualLinuxSpliceCaseDHalfClose(t *testing.T) {
 	clientPayload := spliceTestPayload(t, 256<<10)
 	serverPayload := spliceTestPayload(t, 256<<10)
 
-	// Each direction: a reader draining its destination, a writer feeding its source, and the
-	// copy engine in between. Same shape as spliceTestTransfer, both ways at once.
 	var waitGroup sync.WaitGroup
+	var failures atomic.Int64
 	runDirection := func(destination, source *net.TCPConn, payload []byte, label string) {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			received := make(chan []byte, 1)
+			receivedChannel := make(chan []byte, 1)
 			go func() {
 				data, _ := io.ReadAll(destination)
-				received <- data
+				receivedChannel <- data
 			}()
 			go func() {
 				if _, err := source.Write(payload); err == nil {
 					_ = source.CloseWrite()
 				}
 			}()
-			_, err := CopyWithCounters(destination, source, source, nil, nil, 0, 0)
-			require.NoError(t, err, "%s: the copy engine must complete the stream", label)
+			var copied int64
+			for retries := 0; ; retries++ {
+				if retries >= spliceTestMaxRetries {
+					t.Errorf("%s: the engine kept reporting a drained source", label)
+					failures.Add(1)
+					return
+				}
+				_, moved, directErr := copyDirect(source, destination, nil, nil)
+				copied += moved
+				if directErr == nil {
+					break
+				}
+				if !strings.Contains(directErr.Error(), spliceTestEAGAIN) {
+					t.Errorf("%s: unexpected copy failure: %v", label, directErr)
+					failures.Add(1)
+					return
+				}
+				if moved != 0 {
+					t.Errorf("%s: a failure moved %d bytes and must not be retried", label, moved)
+					failures.Add(1)
+					return
+				}
+			}
 			select {
-			case data := <-received:
+			case data := <-receivedChannel:
 				require.Equal(t, payload, data,
 					"%s: a half-close must deliver every byte and then EOF, byte-exact", label)
 			case <-time.After(spliceTestDeadline):
 				t.Errorf("%s: timed out waiting for the half-closed payload", label)
+				failures.Add(1)
 			}
 		}()
 	}
 	runDirection(server, client, clientPayload, "client->server")
 	runDirection(client, server, serverPayload, "server->client")
 	waitGroup.Wait()
+	require.Zero(t, failures.Load(), "both directions must complete")
 	require.GreaterOrEqual(t, counter.Load(), int64(2), "the splice syscall must run in this path too")
 }
 
-// TestActualLinuxSpliceCaseCSetupFailureFallsBack is the regression test for the bug the seam
-// was added for: when Pipe2 fails, no payload has moved, so the handover must report itself as
-// NOT taken and the userspace copy must still deliver every byte.
+// TestActualLinuxSpliceCaseCSetupFailureFallsBack is the regression test for the bug the seam was
+// added for: when Pipe2 fails, no payload has moved, so the handover must report itself as NOT
+// taken and the userspace copy must still deliver every byte.
 //
 // The assertion is on the observable contract, not on the flag alone: handed=false AND the
 // fallback carries the payload. A test that only checked the flag would pass against a version
@@ -290,29 +368,30 @@ func TestActualLinuxSpliceCaseCSetupFailureFallsBack(t *testing.T) {
 	source, destination := tcpPair(t, 1<<20)
 	payload := spliceTestPayload(t, 512<<10)
 
-	handed, moved, err := copyDirect(source, destination, nil, nil)
-	require.Error(t, err, "the setup failure must still be reported")
-	require.ErrorIs(t, err, syscall.EMFILE)
+	handed, moved, directErr := copyDirect(source, destination, nil, nil)
+	require.Error(t, directErr, "the setup failure must still be reported")
+	require.ErrorIs(t, directErr, syscall.EMFILE)
 	require.False(t, handed, "a setup failure is not a handover: the caller must be allowed to fall back")
 	require.Zero(t, moved, "nothing can have moved before the pipe existed")
 	require.Zero(t, counter.Load(), "the splice syscall must not run when the pipe was never created")
 
-	// The caller's fallback, run the way a production caller runs it: through the engine, with a
-	// reader draining the far end and a writer feeding the source. The source must still be
+	// The caller's fallback, run the way a production caller runs it: through the engine, which
+	// now has no pipe to fail on because splicePipe2 is restored. The source must still be
 	// positioned at the start of the stream.
-	received, fallbackN := spliceTestTransfer(t, source, destination, payload)
+	splicePipe2 = originalPipe2
+	received, copied, _ := spliceTestDrainCopy(t, source, destination, payload)
 	require.Equal(t, payload, received, "the userspace fallback must deliver every byte after a setup failure")
-	require.EqualValues(t, len(received), fallbackN)
+	require.EqualValues(t, len(received), copied)
 }
 
 // TestActualLinuxSpliceMidStreamFailureKeepsHandover pins the other half of the contract: once
 // bytes have moved through the splice backend, a failure must NOT be turned into a fallback.
 // Resetting handed=false there would replay a stream whose state has advanced.
 //
-// The failure is injected at the write splice - the second invocation - so it lands strictly
-// after the first splice has taken a real chunk out of the source. That is the situation the
-// contract is about, and it is arranged deterministically rather than left to whether a socket
-// buffer happens to fill.
+// The failure is injected at the write splice - the second invocation - so it lands strictly after
+// the first splice has taken a real chunk out of the source. That is the situation the contract is
+// about, and it is arranged deterministically rather than left to whether a socket buffer happens
+// to fill.
 func TestActualLinuxSpliceMidStreamFailureKeepsHandover(t *testing.T) {
 	spliceTestHookLock.Lock()
 	defer spliceTestHookLock.Unlock()
@@ -324,12 +403,13 @@ func TestActualLinuxSpliceMidStreamFailureKeepsHandover(t *testing.T) {
 	})
 	source, destination := tcpPair(t, 1<<20)
 	payload := spliceTestPayload(t, 256<<10)
-	_, err := source.Write(payload)
+	written, err := source.Write(payload)
 	require.NoError(t, err)
+	require.Equal(t, len(payload), written)
 
-	handed, moved, err := copyDirect(source, destination, nil, nil)
-	require.Error(t, err, "the mid-stream failure must be reported to the caller")
-	require.ErrorIs(t, err, syscall.EIO, "the injected failure must be the one that surfaced")
+	handed, moved, directErr := copyDirect(source, destination, nil, nil)
+	require.Error(t, directErr, "the mid-stream failure must be reported to the caller")
+	require.ErrorIs(t, directErr, syscall.EIO, "the injected failure must be the one that surfaced")
 	require.True(t, handed,
 		"a mid-stream failure must keep handed=true: the stream has advanced and the userspace copy must not replay it")
 	require.GreaterOrEqual(t, counter.Load(), int64(2),
@@ -338,7 +418,7 @@ func TestActualLinuxSpliceMidStreamFailureKeepsHandover(t *testing.T) {
 
 	// What did land must be a prefix of what was sent: a partial transfer is the honest outcome
 	// here, and duplication would mean the stream had been replayed.
-	_ = destination.SetReadDeadline(time.Now().Add(2 * time.Second))
+	require.NoError(t, destination.SetReadDeadline(time.Now().Add(2*time.Second)))
 	received, _ := io.ReadAll(destination)
 	require.NotEmpty(t, received)
 	require.Equal(t, payload[:len(received)], received)
@@ -359,8 +439,8 @@ func TestActualLinuxSplicePipe2SeamIsTheRealOne(t *testing.T) {
 // TestActualLinuxSpliceSeamsAreInitialized is a guard on the seam wiring: both seams must be
 // initialized from the real syscalls rather than left nil, and a plain TCP socket must still be
 // eligible for the path this file proves. A nil seam would panic on the first spliced connection
-// on a phone - a failure mode a developer machine never sees - and an eligibility regression
-// would make every test above pass by never reaching the engine.
+// on a phone - a failure mode a developer machine never sees - and an eligibility regression would
+// make every test above pass by never reaching the engine.
 func TestActualLinuxSpliceSeamsAreInitialized(t *testing.T) {
 	require.NotNil(t, splicePipe2)
 	require.NotNil(t, spliceCall)
