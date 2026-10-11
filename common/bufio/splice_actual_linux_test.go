@@ -123,10 +123,25 @@ func spliceTestPayload(t *testing.T, size int) []byte {
 // spliceTestProxyCopy runs the production copy path across two independent pairs and returns what
 // the consumer received and the byte count Copy reported.
 //
-// source is the reader side of pair A, destination is the writer side of pair B, and the producer
-// and consumer own the far ends. Nothing writes from source to destination except the copy engine.
+// The four roles are separate sockets and the function asserts that the engine's source and
+// destination are not the two ends of one connection, because that mistake silently moves the
+// payload behind the engine's back instead of failing:
+//
+//	producer.Write ──> sourceReader  (the socket the engine reads)
+//	consumer.Read <── destinationWriter (the socket the engine writes)
 func spliceTestProxyCopy(t *testing.T, producer, sourceReader, destinationWriter, consumer *net.TCPConn, payload []byte) ([]byte, int64) {
 	t.Helper()
+
+	// The invariant this whole file rests on. When the source and the destination are peers of one
+	// connection, the payload can travel from producer to consumer without the engine touching it,
+	// and every assertion below would still pass. Refuse to run in that shape.
+	require.NotEqual(t, sourceReader.LocalAddr().String(), destinationWriter.RemoteAddr().String(),
+		"the engine's source and destination must be on two independent TCP connections, not two ends of one: %s",
+		describeWiring("producer", producer)+" "+describeWiring("source", sourceReader)+" "+
+			describeWiring("destination", destinationWriter)+" "+describeWiring("consumer", consumer))
+	require.NotEqual(t, producer.LocalAddr().String(), consumer.RemoteAddr().String(),
+		"the producer and the consumer must be on two independent TCP connections: %s",
+		describeWiring("producer", producer)+" "+describeWiring("consumer", consumer))
 
 	// The consumer starts draining before anything is copied, so the destination's receive window
 	// never closes on a stalled reader.
@@ -141,8 +156,8 @@ func spliceTestProxyCopy(t *testing.T, producer, sourceReader, destinationWriter
 		received <- data
 	}()
 
-	// The producer feeds the reader side of pair A and half-closes when it is done, which is what
-	// gives the engine its EOF.
+	// The producer feeds the socket the engine will read, and half-closes when it is done, which is
+	// what gives the engine its EOF.
 	writeErr := make(chan error, 1)
 	go func() {
 		_, err := producer.Write(payload)
@@ -173,6 +188,12 @@ func spliceTestProxyCopy(t *testing.T, producer, sourceReader, destinationWriter
 	}
 }
 
+// describeWiring renders one socket's identity, so a topology failure names the sockets instead of
+// just failing.
+func describeWiring(role string, conn *net.TCPConn) string {
+	return role + "[" + conn.LocalAddr().String() + "<->" + conn.RemoteAddr().String() + "]"
+}
+
 // TestActualLinuxSpliceCaseA is the case the objective names: a real TCP stream moved by the
 // production copy path over two independent pairs.
 func TestActualLinuxSpliceCaseA(t *testing.T) {
@@ -183,7 +204,7 @@ func TestActualLinuxSpliceCaseA(t *testing.T) {
 	proxyPair := spliceTestNewPair(t, 1<<20)
 	payload := spliceTestPayload(t, 1<<20)
 
-	received, copied := spliceTestProxyCopy(t, producerPair.client, proxyPair.server, proxyPair.client, producerPair.server, payload)
+	received, copied := spliceTestProxyCopy(t, producerPair.client, producerPair.server, proxyPair.client, proxyPair.server, payload)
 
 	require.Equal(t, payload, received, "the payload must be byte-exact: no duplication, no truncation")
 	require.EqualValues(t, len(payload), copied, "the engine must report every byte it moved")
@@ -201,7 +222,7 @@ func TestActualLinuxSpliceCaseESizes(t *testing.T) {
 			proxyPair := spliceTestNewPair(t, 1<<20)
 			payload := spliceTestPayload(t, size)
 
-			received, copied := spliceTestProxyCopy(t, producerPair.client, proxyPair.server, proxyPair.client, producerPair.server, payload)
+			received, copied := spliceTestProxyCopy(t, producerPair.client, producerPair.server, proxyPair.client, proxyPair.server, payload)
 
 			require.Equal(t, payload, received, "a %d byte stream must arrive byte-exact", size)
 			require.EqualValues(t, len(payload), copied)
@@ -239,8 +260,8 @@ func TestActualLinuxSpliceCaseDHalfClose(t *testing.T) {
 		payload     []byte
 	}
 	directions := []direction{
-		{"A->B", aProducerPair.client, aProxyPair.server, aProxyPair.client, aProducerPair.server, payloadAB},
-		{"B->A", bProducerPair.client, bProxyPair.server, bProxyPair.client, bProducerPair.server, payloadBA},
+		{"A->B", aProducerPair.client, aProducerPair.server, aProxyPair.client, aProxyPair.server, payloadAB},
+		{"B->A", bProducerPair.client, bProducerPair.server, bProxyPair.client, bProxyPair.server, payloadBA},
 	}
 	var waitGroup sync.WaitGroup
 	for _, item := range directions {
@@ -323,7 +344,7 @@ func TestPipe2SetupFailureFallsBackWhenThePipeCannotBeCreated(t *testing.T) {
 	proxyPair := spliceTestNewPair(t, 1<<20)
 	payload := spliceTestPayload(t, 512<<10)
 
-	received, copied := spliceTestProxyCopy(t, producerPair.client, proxyPair.server, proxyPair.client, producerPair.server, payload)
+	received, copied := spliceTestProxyCopy(t, producerPair.client, producerPair.server, proxyPair.client, proxyPair.server, payload)
 
 	require.Equal(t, payload, received,
 		"a Pipe2 setup failure must fall back to the userspace copy and still deliver every byte")
@@ -357,25 +378,27 @@ func TestActualLinuxSpliceMidStreamFailureIsReported(t *testing.T) {
 	proxyPair := spliceTestNewPair(t, 0)
 	payload := spliceTestPayload(t, 256<<10)
 
-	// Everything the reader will ever get is written before the copy starts, so the engine has
-	// real bytes to move.
+	// Everything the reader will ever get is written before the copy starts, so the engine has real
+	// bytes to move, and the reader side of that same connection is what the engine reads.
 	written, err := producerPair.client.Write(payload)
 	require.NoError(t, err)
 	require.Equal(t, len(payload), written)
 
-	// A destination that cannot accept the bytes: a tiny send buffer and no reader on the far end.
+	// A destination that cannot accept the bytes: a tiny send buffer and nothing reading the far
+	// end, so the write splice exhausts the pipe and then fails. The failure happens after bytes
+	// have left the source, which is the situation the handed contract is about.
 	require.NoError(t, proxyPair.client.SetWriteBuffer(1024))
 
-	handed, moved, directErr := copyDirect(proxyPair.server, proxyPair.client, nil, nil)
+	handed, moved, directErr := copyDirect(producerPair.server, proxyPair.client, nil, nil)
 	require.Error(t, directErr, "a copy that cannot make progress must report an error")
 	require.True(t, handed,
 		"a mid-stream failure must keep handed=true: the stream has advanced and the userspace copy must not replay it")
 	require.Positive(t, moved, "bytes had already moved, which is what makes a fallback unsafe here")
 
-	// What did land must be a prefix of what was sent: a partial transfer is the honest outcome
-	// here, and duplication would mean the stream had been replayed.
-	require.NoError(t, producerPair.server.SetReadDeadline(time.Now().Add(spliceTestLeftoverDrain)))
-	received, _ := io.ReadAll(producerPair.server)
+	// What the destination received must be a prefix of what was sent: a partial transfer is the
+	// honest outcome here, and duplication would mean the stream had been replayed.
+	require.NoError(t, proxyPair.server.SetReadDeadline(time.Now().Add(spliceTestLeftoverDrain)))
+	received, _ := io.ReadAll(proxyPair.server)
 	require.NotEmpty(t, received)
 	require.Equal(t, payload[:len(received)], received, "what landed must be a prefix of what was sent")
 }
