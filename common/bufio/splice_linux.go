@@ -11,13 +11,44 @@ import (
 
 const maxSpliceSize = 1 << 20
 
+// splicePipe2 is the one syscall in the engine a test has to be able to make fail.
+//
+// It is a package-level function value initialized to the real unix.Pipe2 at package load, so
+// production behaviour is unchanged: a nil hook is not a state the engine can be in, because the
+// initializer below IS the real syscall. The cost is one indirect call per splice, not per byte.
+//
+// # Why only this one
+//
+// A Pipe2 failure used to be reported as a completed handover (handed was set before the pipe
+// existed) and the regression test for that has to be able to fail Pipe2 on demand; there is no
+// way to exhaust pipe descriptors reliably enough inside a unit test to reach the path any other
+// way.
+//
+// The splice syscall itself is deliberately NOT behind a seam. "The splice backend was selected"
+// and "the splice syscall ran" are different claims, and the second one is proved the way a
+// kernel-level claim should be: by tracing the syscall on a Linux runner, not by routing
+// production through a mutable function value that a test can replace. See
+// .github/workflows/linux-splice-proof.yml.
+var splicePipe2 = unix.Pipe2
+
 func splice(source syscall.RawConn, sourceReader N.SyscallReader, destination syscall.RawConn, destinationWriter N.SyscallWriter, readCounters []N.CountFunc, writeCounters []N.CountFunc) (handed bool, n int64, err error) {
-	handed = true
+	// handed is set once the splice backend has been entered, and cleared again on any
+	// failure that happens before a single payload byte has moved.
+	//
+	// The contract with the caller (bufio.CopyWithCounters) is: handed=true means "this
+	// function owns the stream now, do not run the userspace copy"; handed=false means
+	// "nothing was consumed, run your fallback". A setup failure that leaves handed true
+	// is therefore not a small inaccuracy: the caller returns, the userspace copy never
+	// runs, and a session that moved zero bytes is indistinguishable from a stall.
 	var pipeFDs [2]int
-	err = unix.Pipe2(pipeFDs[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK)
+	err = splicePipe2(pipeFDs[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK)
 	if err != nil {
-		return
+		// Setup failure. No payload has been read from the source and nothing has been
+		// written anywhere, so the stream is exactly where the caller left it and the
+		// userspace copy can take over from here. handed is left false for that reason.
+		return false, 0, err
 	}
+	handed = true
 	defer unix.Close(pipeFDs[0])
 	defer unix.Close(pipeFDs[1])
 	_, _ = unix.FcntlInt(uintptr(pipeFDs[0]), unix.F_SETPIPE_SZ, maxSpliceSize)
