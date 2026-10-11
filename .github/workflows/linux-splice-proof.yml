@@ -116,7 +116,15 @@ jobs:
           strace -V | head -n 1
           go test -c -o /tmp/bufio.test ./common/bufio
           strace -f -qq -e trace=splice -o /tmp/splice.trace \
-            /tmp/bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1
+            /tmp/bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1 2>&1 | tee /tmp/splice.test.log
+          # "no tests to run" would leave the trace empty and be reported as "the fast path did not
+          # run" - which is the right verdict for the wrong reason, and it happened on this workflow's
+          # first dev run, where the test does not exist yet. Name the missing test instead.
+          if grep -q 'no tests to run' /tmp/splice.test.log; then
+            echo "FAIL: TestActualLinuxSpliceCaseA does not exist at this revision, so the trace" >&2
+            echo "      proves nothing. The proof tests live on the branch that adds them." >&2
+            exit 1
+          fi
           echo "--- splice syscalls observed ---"
           grep -c 'splice(' /tmp/splice.trace || true
           grep 'splice(' /tmp/splice.trace | head -n 40
