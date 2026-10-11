@@ -11,32 +11,25 @@ import (
 
 const maxSpliceSize = 1 << 20
 
-// The two syscalls the splice engine cannot be tested without sit behind package-level
-// function values, initialized to the real ones at package load.
+// splicePipe2 is the one syscall in the engine a test has to be able to make fail.
 //
-// # Why this is not a hot-path cost
+// It is a package-level function value initialized to the real unix.Pipe2 at package load, so
+// production behaviour is unchanged: a nil hook is not a state the engine can be in, because the
+// initializer below IS the real syscall. The cost is one indirect call per splice, not per byte.
 //
-// Each is called once per splice iteration - not per byte, not per packet - and a call
-// through a function value is one indirect call in place of a direct one. There is no
-// branch, no atomic and no logging here: a test that needs to observe a call swaps the
-// variable out and counts in its own closure. A nil hook is not a state the engine can be
-// in, because the initializers below ARE the real syscalls, so production behaves exactly
-// as it did when the symbols were called directly.
+// # Why only this one
 //
-// # What each seam exists to prove
+// A Pipe2 failure used to be reported as a completed handover (handed was set before the pipe
+// existed) and the regression test for that has to be able to fail Pipe2 on demand; there is no
+// way to exhaust pipe descriptors reliably enough inside a unit test to reach the path any other
+// way.
 //
-// splicePipe2 exists because a Pipe2 failure used to be reported as a completed handover,
-// and the regression test for that has to be able to make Pipe2 fail on demand. There is
-// no way to exhaust pipe descriptors reliably enough inside a unit test to reach the path
-// any other way.
-//
-// spliceCall exists because "the splice backend was selected" and "the splice syscall ran"
-// are different claims, and only the second one is the thing being shipped. A test can
-// count invocations and still call the real syscall: it observes, it does not replace.
-var (
-	splicePipe2 = unix.Pipe2
-	spliceCall  = unix.Splice
-)
+// The splice syscall itself is deliberately NOT behind a seam. "The splice backend was selected"
+// and "the splice syscall ran" are different claims, and the second one is proved the way a
+// kernel-level claim should be: by tracing the syscall on a Linux runner, not by routing
+// production through a mutable function value that a test can replace. See
+// .github/workflows/linux-splice-proof.yml.
+var splicePipe2 = unix.Pipe2
 
 func splice(source syscall.RawConn, sourceReader N.SyscallReader, destination syscall.RawConn, destinationWriter N.SyscallWriter, readCounters []N.CountFunc, writeCounters []N.CountFunc) (handed bool, n int64, err error) {
 	// handed is set once the splice backend has been entered, and cleared again on any
@@ -67,14 +60,14 @@ func splice(source syscall.RawConn, sourceReader N.SyscallReader, destination sy
 		notFirstTime bool
 	)
 	readFunc := func(fd uintptr) (done bool) {
-		p0, p1 := spliceCall(int(fd), nil, pipeFDs[1], nil, maxSpliceSize, unix.SPLICE_F_NONBLOCK)
+		p0, p1 := unix.Splice(int(fd), nil, pipeFDs[1], nil, maxSpliceSize, unix.SPLICE_F_NONBLOCK)
 		readN = int(p0)
 		readErr = p1
 		return readErr != unix.EAGAIN
 	}
 	writeFunc := func(fd uintptr) (done bool) {
 		for writeSize > 0 {
-			p0, p1 := spliceCall(pipeFDs[0], nil, int(fd), nil, writeSize, unix.SPLICE_F_NONBLOCK|unix.SPLICE_F_MOVE)
+			p0, p1 := unix.Splice(pipeFDs[0], nil, int(fd), nil, writeSize, unix.SPLICE_F_NONBLOCK|unix.SPLICE_F_MOVE)
 			writeN := int(p0)
 			writeErr = p1
 			if writeErr != nil {
