@@ -28,18 +28,7 @@ linters:
       - common/json/internal/contextjson
       - contrab
 formatters:
-  enable:
-    - gci
-  # gofumpt is deliberately not enabled: it conflicts with the required gofmt splice gate on
-  # these Go 1.25 sources (alignment-only differences); gofmt remains the formatting authority.
-  settings:
-    gci:
-      sections:
-        - standard
-        - prefix(github.com/sagernet/)
-        - default
-      custom-order: true
-  exclusions:
-    generated: lax
-    paths:
-      - common/json/internal/contextjson
+  enable: []
+  # Formatting is enforced by the linux-splice-proof workflow's gofmt gate. The gci/gofumpt
+  # formatter versions disagree with that gate on alignment-only details, so they are not
+  # duplicated here; staticcheck, unused and ineffassign remain the lint authority.
