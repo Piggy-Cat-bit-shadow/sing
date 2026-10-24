@@ -222,6 +222,7 @@ func (c *noBatchConn) ReadFrom(p []byte) (int, net.Addr, error) { return 0, nil,
 func (c *noBatchConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return 0, net.ErrClosed
 }
+
 func (c *noBatchConn) Close() error {
 	select {
 	case <-c.closed:

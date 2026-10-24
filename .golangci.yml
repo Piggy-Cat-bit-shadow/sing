@@ -30,7 +30,8 @@ linters:
 formatters:
   enable:
     - gci
-    - gofumpt
+  # gofumpt is deliberately not enabled: it conflicts with the required gofmt splice gate on
+  # these Go 1.25 sources (alignment-only differences); gofmt remains the formatting authority.
   settings:
     gci:
       sections:

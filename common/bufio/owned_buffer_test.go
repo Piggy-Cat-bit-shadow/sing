@@ -90,6 +90,7 @@ type fullGeometry struct{ *geometryDestination }
 
 func (d fullGeometry) WriteBuffer(buffer *buf.Buffer) error { return d.writeBuffer(buffer) }
 func (d fullGeometry) WriterMTU() int                       { return d.geometryDestination.writerMTU }
+
 func (d fullGeometry) FrontHeadroom() int {
 	return d.geometryDestination.frontHeadroom
 }
