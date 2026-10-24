@@ -53,9 +53,6 @@ const (
 	// spliceTestDeadline bounds a socket operation. Every assertion here is about correctness,
 	// not latency; the deadline exists so a regression fails with an error instead of hanging.
 	spliceTestDeadline = 60 * time.Second
-	// spliceTestLeftoverDrain bounds the read of whatever the engine left behind after a
-	// deliberate mid-stream failure. It is short because there is nothing to wait for.
-	spliceTestLeftoverDrain = 2 * time.Second
 )
 
 // spliceTestPair is one independent TCP connection, both ends usable as a proxy would use them.

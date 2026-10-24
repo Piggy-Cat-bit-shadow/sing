@@ -256,7 +256,6 @@ func (p *preconnectPool) loop(ctx context.Context) {
 		case <-timerC:
 			timerC = nil
 		}
-		established := false
 		for p.needsRefill(ctx) {
 			conn, err := p.dial(ctx)
 			if err != nil {
@@ -279,12 +278,8 @@ func (p *preconnectPool) loop(ctx context.Context) {
 				break
 			}
 			backoff = preconnectBackoffMin
-			established = true
 			p.releasePending()
 			p.put(conn)
-		}
-		if !established && timerC == nil {
-			// Nothing to do; wait for the next nudge.
 		}
 	}
 }

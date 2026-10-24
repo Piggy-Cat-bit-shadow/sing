@@ -2,16 +2,16 @@ package bufio
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/sagernet/sing/common/buf"
 
 	"github.com/stretchr/testify/require"
-	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
 )
 
 // Tests for WriteOwnedBuffer, the geometry-based ownership hand-off used for a cached first payload.

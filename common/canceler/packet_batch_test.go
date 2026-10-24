@@ -56,10 +56,6 @@ type fakeConnectedConn struct {
 	destination M.Socksaddr
 
 	access sync.Mutex
-	// readCreates and writeCreates count creator invocations on the INNER connection,
-	// which proves the wrapper delegated rather than substituting its own reader.
-	readCreates  int
-	writeCreates int
 	// batchReads and batchWrites count the batches actually performed.
 	batchReads  int
 	batchWrites int
@@ -120,16 +116,10 @@ func (c *fakeConnectedConn) SetWriteDeadline(t time.Time) error { return c.deadl
 func (c *fakeConnectedConn) SetDeadline(t time.Time) error      { return c.deadlineErr }
 
 func (c *fakeConnectedConn) CreateConnectedPacketBatchReadWaiter() (N.ConnectedPacketBatchReadWaiter, bool) {
-	c.access.Lock()
-	c.readCreates++
-	c.access.Unlock()
 	return &fakeBatchReadWaiter{conn: c}, true
 }
 
 func (c *fakeConnectedConn) CreateConnectedPacketBatchWriter() (N.ConnectedPacketBatchWriter, bool) {
-	c.access.Lock()
-	c.writeCreates++
-	c.access.Unlock()
 	return &fakeBatchWriter{conn: c}, true
 }
 
@@ -152,12 +142,6 @@ func (c *fakeConnectedConn) counts() (reads, writes, lastLen int) {
 	c.access.Lock()
 	defer c.access.Unlock()
 	return c.batchReads, c.batchWrites, c.lastBatchLen
-}
-
-func (c *fakeConnectedConn) creatorCounts() (reads, writes int) {
-	c.access.Lock()
-	defer c.access.Unlock()
-	return c.readCreates, c.writeCreates
 }
 
 type fakeBatchReadWaiter struct {

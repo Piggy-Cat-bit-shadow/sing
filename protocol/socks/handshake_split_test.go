@@ -184,18 +184,6 @@ func newScriptedServer(t *testing.T, s *scriptedServer) *scriptedServer {
 	return s
 }
 
-func (s *scriptedServer) address() (string, uint16) { return "127.0.0.1", s.port }
-
-// awaitGreeting blocks until the server has recorded the greeting.
-func (s *scriptedServer) awaitGreeting(t *testing.T) {
-	t.Helper()
-	select {
-	case <-s.greetingDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("server never received the greeting")
-	}
-}
-
 // awaitAuth blocks until the server has recorded the username/password exchange.
 func (s *scriptedServer) awaitAuth(t *testing.T) {
 	t.Helper()
@@ -213,16 +201,6 @@ func (s *scriptedServer) awaitCommand(t *testing.T) {
 	case <-s.commandDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the command")
-	}
-}
-
-// authAttempted reports whether the auth phase finished, without blocking.
-func (s *scriptedServer) authAttempted() bool {
-	select {
-	case <-s.authDone:
-		return true
-	default:
-		return false
 	}
 }
 

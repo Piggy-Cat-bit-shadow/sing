@@ -5,10 +5,13 @@ linters:
   default: none
   enable:
     - ineffassign
-    - paralleltest
     - staticcheck
     - unused
-    - modernize
+    # paralleltest is deliberately not enabled: many of these tests use real loopback
+    # sockets, shared process-wide hooks and timers, and adding t.Parallel() mechanically
+    # would create cross-test interference rather than coverage.
+    # modernize is deliberately not enabled: its style rewrites are not required for this
+    # fork and would touch validated network/splice tests without adding behavior.
   settings:
     staticcheck:
       checks:
