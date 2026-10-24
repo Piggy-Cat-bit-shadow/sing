@@ -608,3 +608,39 @@ func testBuffersBytes(values ...[]byte) []*buf.Buffer {
 	}
 	return buffers
 }
+
+func TestPacketBatchWriterMessageTooLongContinues(t *testing.T) {
+	t.Parallel()
+	destination := M.SocksaddrFrom(netip.MustParseAddr("127.0.0.1"), 1000)
+	writer := &testOversizePacketWriter{failAt: 1}
+	require.ErrorIs(t, NewPacketBatchWriter(writer).WritePacketBatch(
+		testBuffers("too-large", "delivered"),
+		[]M.Socksaddr{destination, destination},
+	), errMessageTooLong)
+	require.Equal(t, 1, writer.written, "the packet after the oversize one must still be attempted")
+}
+
+func TestConnectedPacketBatchWriterMessageTooLongContinues(t *testing.T) {
+	t.Parallel()
+	writer := &testOversizePacketWriter{failAt: 1}
+	require.ErrorIs(t, NewConnectedPacketBatchWriter(writer).WriteConnectedPacketBatch(
+		testBuffers("too-large", "delivered"),
+	), errMessageTooLong)
+	require.Equal(t, 1, writer.written, "the packet after the oversize one must still be attempted")
+}
+
+type testOversizePacketWriter struct {
+	failAt  int
+	count   int
+	written int
+}
+
+func (w *testOversizePacketWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
+	w.count++
+	if w.count == w.failAt {
+		return errMessageTooLong
+	}
+	w.written++
+	buffer.Release()
+	return nil
+}
