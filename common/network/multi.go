@@ -121,6 +121,8 @@ func DialParallel(ctx context.Context, dialer Dialer, network string, destinatio
 	startAttempt()
 	for {
 		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-attemptDelay:
 			startAttempt()
 		case result := <-results:
