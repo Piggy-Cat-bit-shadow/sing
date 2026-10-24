@@ -541,11 +541,14 @@ func TestPoolDoesNotPoolUDPOrBind(t *testing.T) {
 	waitFor(t, "a parked connection", func() bool { return client.preconnect.idleCount() == 1 })
 
 	commandsBefore := server.commands.Load()
-	_, err := client.DialContext(context.Background(), N.NetworkUDP,
+	udpConn, err := client.DialContext(context.Background(), N.NetworkUDP,
 		M.ParseSocksaddr("192.0.2.10:443").Unwrap())
 	// The fake server answers the associate request and then closes; an error or a
 	// successful associate are both acceptable here. What matters is the pool.
 	if err == nil {
+		// Close the associate connection so the fake server's io.Copy returns; a leaked
+		// connection keeps the server's WaitGroup from finishing and hangs cleanup.
+		t.Cleanup(func() { _ = udpConn.Close() })
 		t.Log("UDP associate returned a conn; asserting only the pool invariant")
 	}
 
