@@ -1,6 +1,8 @@
 package bufio
 
 import (
+	"errors"
+
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
@@ -69,15 +71,20 @@ type fallbackPacketBatchWriter struct {
 }
 
 func (w *fallbackPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	var messageTooLongErr error
 	for index, buffer := range buffers {
 		err := w.writer.WritePacket(buffer, destinations[index])
 		if err != nil {
-			buffer.Release()
+			buffer.Leak()
+			if errors.Is(err, errMessageTooLong) {
+				messageTooLongErr = err
+				continue
+			}
 			buf.ReleaseMulti(buffers[index+1:])
 			return err
 		}
 	}
-	return nil
+	return messageTooLongErr
 }
 
 type fallbackConnectedPacketBatchWriter struct {
@@ -85,13 +92,18 @@ type fallbackConnectedPacketBatchWriter struct {
 }
 
 func (w *fallbackConnectedPacketBatchWriter) WriteConnectedPacketBatch(buffers []*buf.Buffer) error {
+	var messageTooLongErr error
 	for index, buffer := range buffers {
 		err := w.writer.WritePacket(buffer, M.Socksaddr{})
 		if err != nil {
-			buffer.Release()
+			buffer.Leak()
+			if errors.Is(err, errMessageTooLong) {
+				messageTooLongErr = err
+				continue
+			}
 			buf.ReleaseMulti(buffers[index+1:])
 			return err
 		}
 	}
-	return nil
+	return messageTooLongErr
 }
