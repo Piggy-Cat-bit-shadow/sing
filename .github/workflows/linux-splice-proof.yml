@@ -232,12 +232,26 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq strace
           fi
-          go mod download github.com/sagernet/sing
-          module_directory="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing)"
+          # Same cache-path resolution as the content check: go list -m -f '{{.Dir}}' is empty until
+          # the module has been fetched, and running tests from /common/bufio would fail confusingly.
+          version="$(grep -E '^replace github\.com/sagernet/sing =>' go.mod | awk '{print $NF}')"
+          module_directory="$(go env GOMODCACHE)/github.com/!piggy-!cat-bit-shadow/sing@${version}"
+          echo "pinned at: ${version}"
+          test -d "${module_directory}/common/bufio" || {
+            echo "FAIL: the pinned module is not in the cache at ${module_directory}" >&2
+            exit 1
+          }
           go test -count=1 -v -run '^TestPipe2SetupFailure' "${module_directory}/common/bufio"
           go test -c -o /tmp/pinned-bufio.test "${module_directory}/common/bufio"
           strace -f -qq -e trace=splice -o /tmp/pinned-splice.trace \
-            /tmp/pinned-bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1
+            /tmp/pinned-bufio.test -test.v -test.run '^TestActualLinuxSpliceCaseA$' -test.count=1 2>&1 | tee /tmp/pinned.test.log
+          if grep -q 'no tests to run' /tmp/pinned.test.log; then
+            echo "FAIL: the pinned revision does not carry TestActualLinuxSpliceCaseA, so the trace" >&2
+            echo "      proves nothing about it." >&2
+            exit 1
+          fi
+          echo "--- splice syscalls observed in the PINNED revision ---"
+          grep -c 'splice(' /tmp/pinned-splice.trace || true
           grep 'splice(' /tmp/pinned-splice.trace | head -n 20
           grep -q 'splice(' /tmp/pinned-splice.trace || {
             echo "FAIL: the PINNED revision moved the payload without a splice syscall" >&2

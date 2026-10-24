@@ -1,6 +1,3 @@
-//go:build linux
-
-//nolint:paralleltest // splicePipe2 is a package-level seam: these tests must not run concurrently
 package bufio
 
 import (
@@ -52,9 +49,14 @@ import (
 // moved byte-exact, in full, through the production copy path.
 var spliceTestHookLock sync.Mutex
 
-// spliceTestDeadline bounds a socket operation. Every assertion here is about correctness, not
-// latency; the deadline exists so a regression fails with an error instead of hanging.
-const spliceTestDeadline = 60 * time.Second
+const (
+	// spliceTestDeadline bounds a socket operation. Every assertion here is about correctness,
+	// not latency; the deadline exists so a regression fails with an error instead of hanging.
+	spliceTestDeadline = 60 * time.Second
+	// spliceTestLeftoverDrain bounds the read of whatever the engine left behind after a
+	// deliberate mid-stream failure. It is short because there is nothing to wait for.
+	spliceTestLeftoverDrain = 2 * time.Second
+)
 
 // spliceTestPair is one independent TCP connection, both ends usable as a proxy would use them.
 type spliceTestPair struct {
