@@ -86,16 +86,50 @@ func splice(source syscall.RawConn, sourceReader N.SyscallReader, destination sy
 			if sourceReader != nil {
 				newBuffer, newErr := sourceReader.HandleSyscallReadError(err)
 				if newErr != nil {
-					err = newErr
-				} else {
-					err = nil
-					if len(newBuffer) > 0 {
-						readN, readErr = unix.Write(pipeFDs[1], newBuffer)
-						if readErr != nil {
-							err = E.Cause(err, "write handled data")
+					err = E.Cause(newErr, "splice read")
+					return
+				}
+				// The hook consumed a non-application-data record. It may also have returned
+				// application bytes that followed that record. Those bytes are in the pipe now,
+				// so forward them to the destination before resuming the splice; returning here
+				// would either panic on E.Cause(nil) or strand the bytes in the pipe.
+				readN = 0
+				for len(newBuffer) > 0 {
+					written, writeErr := unix.Write(pipeFDs[1], newBuffer)
+					if writeErr != nil {
+						err = E.Cause(writeErr, "write handled data")
+						return
+					}
+					if written == 0 {
+						err = E.New("write handled data: short write")
+						return
+					}
+					newBuffer = newBuffer[written:]
+					readN += written
+				}
+				if readN > 0 {
+					for _, readCounter := range readCounters {
+						readCounter(int64(readN))
+					}
+					writeSize = readN
+					err = destination.Write(writeFunc)
+					if writeErr != nil {
+						err = writeErr
+					}
+					written := int64(readN - writeSize)
+					if written > 0 {
+						n += written
+						for _, writeCounter := range writeCounters {
+							writeCounter(written)
 						}
 					}
+					if err != nil {
+						err = E.Cause(err, "splice write")
+						return
+					}
+					notFirstTime = true
 				}
+				continue
 			} else if !notFirstTime && E.IsMulti(err, unix.EINVAL, unix.ENOSYS) {
 				handed = false
 				return
