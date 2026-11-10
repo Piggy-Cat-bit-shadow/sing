@@ -1,7 +1,6 @@
 package socks
 
 import (
-	"bytes"
 	"net"
 
 	"github.com/sagernet/sing/common"
@@ -37,39 +36,18 @@ func NewAssociatePacketConn(conn net.Conn, remoteAddr M.Socksaddr, underlying ne
 }
 
 func (c *AssociatePacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, err = c.conn.Read(p)
+	buffer := buf.With(p)
+	destination, err := c.ReadPacket(buffer)
 	if err != nil {
 		return
 	}
-	if n < 3 {
-		return 0, nil, ErrInvalidPacket
-	}
-	reader := bytes.NewReader(p[3:n])
-	destination, err := M.SocksaddrSerializer.ReadAddrPort(reader)
-	if err != nil {
-		return
-	}
-	c.remoteAddr = destination
+	n = copy(p, buffer.Bytes())
 	addr = destination.UDPAddr()
-	index := 3 + int(reader.Size()) - reader.Len()
-	n = copy(p, p[index:n])
 	return
 }
 
 func (c *AssociatePacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	destination := M.SocksaddrFromNet(addr)
-	buffer := buf.NewSize(3 + M.SocksaddrSerializer.AddrPortLen(destination) + len(p))
-	defer buffer.Release()
-	common.Must(buffer.WriteZeroN(3))
-	err = M.SocksaddrSerializer.WriteAddrPort(buffer, destination)
-	if err != nil {
-		return
-	}
-	_, err = buffer.Write(p)
-	if err != nil {
-		return
-	}
-	return c.conn.Write(buffer.Bytes())
+	return bufio.WritePacket(c, p, addr)
 }
 
 func (c *AssociatePacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
@@ -81,18 +59,12 @@ func (c *AssociatePacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Sock
 		return M.Socksaddr{}, ErrInvalidPacket
 	}
 	buffer.Advance(3)
-	destination, err = M.SocksaddrSerializer.ReadAddrPort(buffer)
-	if err != nil {
-		return
-	}
-	c.remoteAddr = destination
-	return destination, nil
+	return M.SocksaddrSerializer.ReadAddrPort(buffer)
 }
 
 func (c *AssociatePacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	header := buf.With(buffer.ExtendHeader(3 + M.SocksaddrSerializer.AddrPortLen(destination)))
-	common.Must(header.WriteZeroN(3))
-	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
+	buffer = N.ReadWaitOptions{FrontHeadroom: 3 + M.SocksaddrSerializer.AddrPortLen(destination)}.Copy(buffer)
+	err := associatePacketOffload{}.EncodePacket(buffer, destination)
 	if err != nil {
 		buffer.Release()
 		return err
@@ -110,7 +82,7 @@ func (c *AssociatePacketConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *AssociatePacketConn) RemoteAddr() net.Addr {
-	return c.remoteAddr.UDPAddr()
+	return c.remoteAddr
 }
 
 func (c *AssociatePacketConn) Upstream() any {

@@ -82,11 +82,11 @@ func (c *UnbindPacketConn) CreateConnectedPacketBatchReadWaiter() (N.ConnectedPa
 		}
 		return &bindConnectedPacketBatchReadWaiter{reader: reader, destination: c.addr}, true
 	case *serverPacketConn:
-		reader, created := CreatePacketBatchReadWaiter(conn.NetPacketConn)
+		reader, created := conn.CreatePacketBatchReadWaiter()
 		if !created {
 			return nil, false
 		}
-		return &serverConnectedPacketBatchReadWaiter{conn: conn, reader: reader, destination: c.addr}, true
+		return &bindConnectedPacketBatchReadWaiter{reader: reader, destination: c.addr}, true
 	default:
 		return createSyscallConnectedPacketBatchReadWaiter(c.ExtendedConn, c.addr)
 	}
@@ -108,26 +108,6 @@ func (r *bindConnectedPacketBatchReadWaiter) WaitReadConnectedPackets() ([]*buf.
 
 func (r *bindConnectedPacketBatchReadWaiter) Upstream() any { return r.reader }
 
-type serverConnectedPacketBatchReadWaiter struct {
-	conn        *serverPacketConn
-	reader      N.PacketBatchReadWaiter
-	destination M.Socksaddr
-}
-
-func (r *serverConnectedPacketBatchReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) bool {
-	return r.reader.InitializeReadWaiter(options)
-}
-
-func (r *serverConnectedPacketBatchReadWaiter) WaitReadConnectedPackets() ([]*buf.Buffer, M.Socksaddr, error) {
-	buffers, destinations, err := r.reader.WaitReadPackets()
-	if err == nil {
-		r.conn.updateRemoteAddr(destinations[len(destinations)-1])
-	}
-	return buffers, r.destination, err
-}
-
-func (r *serverConnectedPacketBatchReadWaiter) Upstream() any { return r.reader }
-
 var (
 	_ N.PacketBatchReadWaitCreator          = (*serverPacketConn)(nil)
 	_ N.ConnectedPacketBatchWriteCreator    = (*UnbindPacketConn)(nil)
@@ -135,5 +115,4 @@ var (
 	_ N.PacketBatchWriteCreator             = (*serverPacketConn)(nil)
 	_ N.ConnectedPacketBatchWriter          = (*boundConnectedPacketBatchWriter)(nil)
 	_ N.ConnectedPacketBatchReadWaiter      = (*bindConnectedPacketBatchReadWaiter)(nil)
-	_ N.ConnectedPacketBatchReadWaiter      = (*serverConnectedPacketBatchReadWaiter)(nil)
 )

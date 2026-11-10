@@ -32,9 +32,19 @@ func TestPacketBatchSendtoResume(t *testing.T) {
 		},
 		{
 			name:        "partial_error",
-			errors:      []syscall.Errno{0, syscall.EMSGSIZE},
+			errors:      []syscall.Errno{0, syscall.EACCES},
 			attempts:    []string{"a", "b"},
 			sent:        []string{"a"},
+			wantErr:     syscall.EACCES,
+			wantWakeups: 1,
+		},
+		{
+			// An oversize datagram is skipped and the rest of the batch is still
+			// sent, with EMSGSIZE reported once the batch completes.
+			name:        "message_too_long_continues",
+			errors:      []syscall.Errno{0, syscall.EMSGSIZE, 0},
+			attempts:    []string{"a", "b", "c"},
+			sent:        []string{"a", "c"},
 			wantErr:     syscall.EMSGSIZE,
 			wantWakeups: 1,
 		},
@@ -52,6 +62,7 @@ func TestPacketBatchSendtoResume(t *testing.T) {
 			t.Parallel()
 			rawConn := &testSendtoRawConn{pollErr: testCase.pollErr}
 			writer := &syscallPacketBatchWriter{rawConn: rawConn, localAddr: netip.MustParseAddrPort("127.0.0.1:1000")}
+			writer.writeFunc = writer.write
 			buffers := testBuffers("a", "b", "c")
 			destination := M.ParseSocksaddr("127.0.0.1:2000")
 			var attempts, sent []string
