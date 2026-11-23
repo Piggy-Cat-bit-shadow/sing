@@ -25,6 +25,20 @@ func Copy(destination io.Writer, source io.Reader) (n int64, err error) {
 }
 
 func CopyWithIncreateBuffer(destination io.Writer, source io.Reader, increaseBufferAfter int64, batchSize int) (n int64, err error) {
+	return copyWithIncreateBuffer(destination, source, increaseBufferAfter, batchSize, nil)
+}
+
+// CopyWithIncreateBufferPermit is CopyWithIncreateBuffer with a growth-boundary seam.
+//
+// permit is asked only when the copy has reached increaseBufferAfter bytes, never when
+// the copy starts; a nil permit is identical to CopyWithIncreateBuffer. The release it
+// returns is called exactly once when this function returns, after the last enlarged
+// buffer has been written. See IncreaseBufferPermit for the contract.
+func CopyWithIncreateBufferPermit(destination io.Writer, source io.Reader, increaseBufferAfter int64, batchSize int, permit IncreaseBufferPermit) (n int64, err error) {
+	return copyWithIncreateBuffer(destination, source, increaseBufferAfter, batchSize, permit)
+}
+
+func copyWithIncreateBuffer(destination io.Writer, source io.Reader, increaseBufferAfter int64, batchSize int, permit IncreaseBufferPermit) (n int64, err error) {
 	if source == nil {
 		return 0, E.New("nil reader")
 	} else if destination == nil {
@@ -58,10 +72,14 @@ func CopyWithIncreateBuffer(destination io.Writer, source io.Reader, increaseBuf
 		}
 		break
 	}
-	return CopyWithCounters(destination, source, originSource, readCounters, writeCounters, increaseBufferAfter, batchSize)
+	return copyWithCounters(destination, source, originSource, readCounters, writeCounters, increaseBufferAfter, batchSize, permit)
 }
 
 func CopyWithCounters(destination io.Writer, source io.Reader, originSource io.Reader, readCounters []N.CountFunc, writeCounters []N.CountFunc, increaseBufferAfter int64, batchSize int) (n int64, err error) {
+	return copyWithCounters(destination, source, originSource, readCounters, writeCounters, increaseBufferAfter, batchSize, nil)
+}
+
+func copyWithCounters(destination io.Writer, source io.Reader, originSource io.Reader, readCounters []N.CountFunc, writeCounters []N.CountFunc, increaseBufferAfter int64, batchSize int, permit IncreaseBufferPermit) (n int64, err error) {
 	sourceReader := source
 	destinationWriter := destination
 	extendedDestination := NewExtendedWriter(destinationWriter)
@@ -69,12 +87,16 @@ func CopyWithCounters(destination io.Writer, source io.Reader, originSource io.R
 	readWaitOptions := N.NewReadWaitOptions(extendedSource, extendedDestination)
 	readWaitOptions.BatchSize = batchSize
 	session := NewCopySession(destinationWriter, sourceReader, originSource, CopyOptions{
-		ReadWaitOptions:     readWaitOptions,
-		IncreaseBufferAfter: increaseBufferAfter,
-		ReadCounters:        readCounters,
-		WriteCounters:       writeCounters,
-		Handshake:           N.NewHandshakeState(sourceReader, destinationWriter),
+		ReadWaitOptions:      readWaitOptions,
+		IncreaseBufferAfter:  increaseBufferAfter,
+		IncreaseBufferPermit: permit,
+		ReadCounters:         readCounters,
+		WriteCounters:        writeCounters,
+		Handshake:            N.NewHandshakeState(sourceReader, destinationWriter),
 	})
+	// The release is owned here, not by a route goroutine wrapper: this is the frame
+	// every exit path of the copy loops below returns through.
+	defer session.releaseIncreaseBufferPermit()
 	refreshUnwrap := func() {
 		sourceReader, readCounters = N.UnwrapCountReader(sourceReader, readCounters)
 		destinationWriter, writeCounters = N.UnwrapCountWriter(destinationWriter, writeCounters)
@@ -118,6 +140,7 @@ func CopyExtended(originSource io.Reader, destination N.ExtendedWriter, source N
 		ReadCounters:        readCounters,
 		WriteCounters:       writeCounters,
 	})
+	defer session.releaseIncreaseBufferPermit()
 	return copyExtended(session, destination, source)
 }
 
@@ -183,6 +206,7 @@ func CopyExtendedWithPool(originSource io.Reader, destination N.ExtendedWriter, 
 		ReadCounters:        readCounters,
 		WriteCounters:       writeCounters,
 	})
+	defer session.releaseIncreaseBufferPermit()
 	return copyExtendedWithPool(session, destination, source)
 }
 
@@ -216,7 +240,11 @@ func copyExtendedWithPool(session *CopySession, destination N.ExtendedWriter, so
 		}
 		notFirstTime = true
 		if !options.IncreaseBuffer && session.options.IncreaseBufferAfter > 0 && n >= session.options.IncreaseBufferAfter {
-			options.IncreaseBuffer = true
+			// The decision is made exactly at the growth boundary, and only then: a
+			// direction that never reaches this point never asks the seam.
+			if session.tryIncreaseBuffer(n) {
+				options.IncreaseBuffer = true
+			}
 		}
 	}
 }

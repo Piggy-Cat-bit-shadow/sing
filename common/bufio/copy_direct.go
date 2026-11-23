@@ -52,6 +52,12 @@ func copyWaitWithPool(session *CopySession, destination N.ExtendedWriter, source
 		}
 		notFirstTime = true
 		if !options.IncreaseBuffer && session.options.IncreaseBufferAfter > 0 && n >= session.options.IncreaseBufferAfter {
+			// Decide at the real growth boundary, not at copy start. A refusal keeps
+			// the small buffer and is retried only at a bounded milestone, so a quiet
+			// direction holds nothing and a refused one does not poll per read.
+			if !session.tryIncreaseBuffer(n) {
+				continue
+			}
 			options.IncreaseBuffer = true
 			vectorisedReadWaiter, isVectorisedReadWaiter := CreateVectorisedReadWaiter(source)
 			vectorisedWriter, isVectorisedWriter := CreateVectorisedWriter(destination)
