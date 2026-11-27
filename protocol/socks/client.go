@@ -157,8 +157,19 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 	// failure when a cold connection would have worked.
 	if c.preconnect != nil && command == socks5.CommandConnect {
 		if warm := c.preconnect.acquire(); warm != nil {
+			// The warm connection already completed greeting and authentication, so the cold
+			// path's handshake timeout does not cover the command round-trip. Without a deadline
+			// a proxy that reads CONNECT and never replies blocks the caller indefinitely while the
+			// cold path would have failed on time; apply the same budget here and clear it on
+			// success, because the deadline would otherwise outlive the hand-off and kill the tunnel.
+			if c.handshakeTimeout > 0 {
+				_ = warm.conn.SetDeadline(time.Now().Add(c.handshakeTimeout))
+			}
 			warmResult, warmErr := c.preconnect.commandOnWarm(warm, command, address)
 			if warmErr == nil {
+				if c.handshakeTimeout > 0 {
+					_ = warmResult.SetDeadline(time.Time{})
+				}
 				return warmResult, nil
 			}
 			// Exactly one cold retry follows; never a loop.

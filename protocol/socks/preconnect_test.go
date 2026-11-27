@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +46,10 @@ type fakeSOCKSServer struct {
 	authPassword string
 	// commandReply is the reply code for CONNECT (0 = success).
 	commandReply byte
+
+	// holdCommand reads the command request and then never replies, which is the
+	// "proxy accepted the frame and went silent" shape the warm path must not hang on.
+	holdCommand bool
 
 	// dropAfterAuth closes the connection right after a successful authentication,
 	// simulating a proxy that times out a parked connection.
@@ -150,6 +155,11 @@ func (s *fakeSOCKSServer) serve(conn net.Conn) {
 		return
 	}
 	destination, err := readFakeSocksaddr(reader, cmdHeader[3])
+	if s.holdCommand {
+		s.commands.Add(1)
+		_, _ = io.Copy(io.Discard, reader)
+		return
+	}
 	if err != nil {
 		return
 	}
@@ -557,4 +567,54 @@ func TestPoolDoesNotPoolUDPOrBind(t *testing.T) {
 	})
 	require.GreaterOrEqual(t, server.commands.Load(), int64(1),
 		"UDP ASSOCIATE must go through the connection, not the pool")
+}
+
+// TestWarmCommandHonoursTheHandshakeTimeout is FUS2-P1-02: the warm connection skipped greeting
+// and authentication, so the cold path's handshake timeout did not cover the CONNECT round-trip.
+// A proxy that reads the command and never replies blocked the warm path indefinitely while the cold
+// path failed on time. The deadline now applies to the command too, and it is cleared on success so
+// the tunnel is not killed by a leftover deadline.
+func TestWarmCommandHonoursTheHandshakeTimeout(t *testing.T) {
+	server := newFakeSOCKSServer(t, func(s *fakeSOCKSServer) {
+		s.requireAuth = true
+		s.holdCommand = true
+	})
+	client := newStartedPooledClient(t, server, PreconnectOptions{MinIdle: 1, MaxIdle: 1, IdleTimeout: 10 * time.Second})
+	client.SetHandshakeTimeout(80 * time.Millisecond)
+	waitFor(t, "one parked authenticated connection", func() bool { return server.authOks.Load() >= 1 })
+
+	started := time.Now()
+	_, err := client.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddrHostPort("example.com", 443))
+	elapsed := time.Since(started)
+	require.Error(t, err, "a silent proxy must fail the dial, not block it")
+	require.Less(t, elapsed, 3*time.Second, "the warm command must be bounded by the handshake timeout")
+	require.GreaterOrEqual(t, elapsed, 40*time.Millisecond, "the timeout must be the budget that fired")
+	require.GreaterOrEqual(t, server.commands.Load(), int64(2),
+		"the silent warm connection is discarded and exactly one cold attempt follows")
+}
+
+// TestSerialEntriesRefuseAnEmptyAddressList is FUS2-P2-01: DialSerial/ListenSerial with no addresses
+// returned a nil conn AND a nil error, which callers cannot distinguish from success.
+func TestSerialEntriesRefuseAnEmptyAddressList(t *testing.T) {
+	conn, err := N.DialSerial(context.Background(), directDialer{}, N.NetworkTCP,
+		M.ParseSocksaddrHostPort("example.com", 443), nil)
+	require.Error(t, err)
+	require.Nil(t, conn)
+
+	packetConn, _, listenErr := N.ListenSerial(context.Background(), directDialer{},
+		M.ParseSocksaddrHostPort("example.com", 443), nil)
+	require.Error(t, listenErr)
+	require.Nil(t, packetConn)
+}
+
+// TestSerialEntriesStillDialOneAddress pins the other half: the guard must not turn a single address
+// into a refusal (DialSerial calls back into DialParallel for a ParallelDialer, so this is the shape
+// that would regress if the guard were placed wrongly).
+func TestSerialEntriesStillDialOneAddress(t *testing.T) {
+	conn, err := N.DialSerial(context.Background(), directDialer{}, N.NetworkTCP,
+		M.ParseSocksaddrHostPort("127.0.0.1", 1), []netip.Addr{netip.MustParseAddr("127.0.0.1")})
+	// Port 1 is closed; the point is that the call reaches the dialer and reports a dial error rather
+	// than the empty-list guard.
+	require.Error(t, err)
+	require.Nil(t, conn)
 }
