@@ -335,9 +335,19 @@ func (p *preconnectPool) idleCount() int {
 //
 // A warm connection can be stale for many reasons - the proxy's idle timeout, a NAT
 // rebind, a server reset, a broken path - so a failure BEFORE the command is
-// accepted closes the connection and asks for exactly one cold retry. A failure
-// after acceptance is not retried, because the command has already had an effect
-// and retrying could duplicate it.
+// accepted closes the connection and asks for exactly one cold retry.
+//
+// Retry semantics at the hand-off boundary, which the caller implements and this
+// function's return value drives:
+//   - the caller's context cancelled: NO cold retry (nobody is waiting for it);
+//   - the configured handshake budget expiring before the reply is consumed: ONE cold
+//     retry, even when the proxy already received the first CONNECT - the warm
+//     connection is treated as stale, and the duplicate CONNECT is the accepted cost
+//     of not failing a request that a cold dial could still serve;
+//   - the reply consumed successfully but the cancellation callback winning the
+//     hand-off race: NO hand-off and NO cold retry (the caller already gave up).
+// A failure AFTER a successful, un-cancelled hand-off is never retried, because the
+// tunnel is live and retrying would duplicate the command.
 func (p *preconnectPool) commandOnWarm(warm *authenticatedConn, command byte, destination M.Socksaddr) (net.Conn, error) {
 	response, err := ClientCommand5(warm.conn, varbin.StubReader(warm.reader), command, destination)
 	if err != nil {
