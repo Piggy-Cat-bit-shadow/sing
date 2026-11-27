@@ -353,7 +353,8 @@ func (p *preconnectPool) idleCount() int {
 //
 // A failure BEFORE the command is accepted (stale, reset, rejected) closes the connection and asks for
 // exactly one cold retry for the same reason. A failure AFTER a successful hand-off is never retried,
-// because the tunnel is live and retrying would duplicate the command.func (p *preconnectPool) commandOnWarm(warm *authenticatedConn, command byte, destination M.Socksaddr) (net.Conn, error) {
+// because the tunnel is live and retrying would duplicate the command.
+func (p *preconnectPool) commandOnWarm(warm *authenticatedConn, command byte, destination M.Socksaddr) (net.Conn, error) {
 	response, err := ClientCommand5(warm.conn, varbin.StubReader(warm.reader), command, destination)
 	if err != nil {
 		p.discard(warm)
