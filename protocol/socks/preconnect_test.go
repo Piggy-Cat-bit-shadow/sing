@@ -581,7 +581,7 @@ func TestWarmCommandHonoursTheHandshakeTimeout(t *testing.T) {
 	})
 	client := newStartedPooledClient(t, server, PreconnectOptions{MinIdle: 1, MaxIdle: 1, IdleTimeout: 10 * time.Second})
 	client.SetHandshakeTimeout(80 * time.Millisecond)
-	waitFor(t, "one parked authenticated connection", func() bool { return server.authOks.Load() >= 1 })
+	waitFor(t, "one parked authenticated connection", func() bool { return client.preconnect.idleCount() >= 1 })
 
 	started := time.Now()
 	_, err := client.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddrHostPort("example.com", 443))
@@ -589,8 +589,8 @@ func TestWarmCommandHonoursTheHandshakeTimeout(t *testing.T) {
 	require.Error(t, err, "a silent proxy must fail the dial, not block it")
 	require.Less(t, elapsed, 3*time.Second, "the warm command must be bounded by the handshake timeout")
 	require.GreaterOrEqual(t, elapsed, 40*time.Millisecond, "the timeout must be the budget that fired")
-	require.GreaterOrEqual(t, server.commands.Load(), int64(2),
-		"the silent warm connection is discarded and exactly one cold attempt follows")
+	require.EqualValues(t, 2, server.commands.Load(),
+		"the silent warm connection is discarded and exactly ONE cold attempt follows")
 }
 
 // TestSerialEntriesRefuseAnEmptyAddressList is FUS2-P2-01: DialSerial/ListenSerial with no addresses
@@ -617,4 +617,37 @@ func TestSerialEntriesStillDialOneAddress(t *testing.T) {
 	// than the empty-list guard.
 	require.Error(t, err)
 	require.Nil(t, conn)
+}
+
+// TestWarmCommandHonoursCallerCancellation is the remainder of FUS2-P1-02: the warm command must react
+// to the caller's context, not only to the configured handshake budget. Cancelling must release the
+// warm connection and must NOT start a cold dial for a request nobody is waiting for.
+func TestWarmCommandHonoursCallerCancellation(t *testing.T) {
+	server := newFakeSOCKSServer(t, func(s *fakeSOCKSServer) {
+		s.requireAuth = true
+		s.holdCommand = true
+	})
+	client := newStartedPooledClient(t, server, PreconnectOptions{MinIdle: 1, MaxIdle: 1, IdleTimeout: 10 * time.Second})
+	client.SetHandshakeTimeout(5 * time.Second)
+	waitFor(t, "one parked authenticated connection", func() bool { return client.preconnect.idleCount() >= 1 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddrHostPort("example.com", 443))
+		result <- err
+	}()
+	waitFor(t, "the warm command to reach the silent proxy", func() bool { return server.commands.Load() >= 1 })
+	cancelledAt := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled, "the warm path must surface the caller's cancellation")
+		require.Less(t, time.Since(cancelledAt), time.Second,
+			"cancellation must release the warm command, not wait for the handshake budget")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the warm command ignored the caller's cancellation")
+	}
+	require.EqualValues(t, 1, server.commands.Load(),
+		"a cancelled request must not start a cold dial")
 }

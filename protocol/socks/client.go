@@ -157,22 +157,32 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 	// failure when a cold connection would have worked.
 	if c.preconnect != nil && command == socks5.CommandConnect {
 		if warm := c.preconnect.acquire(); warm != nil {
-			// The warm connection already completed greeting and authentication, so the cold
-			// path's handshake timeout does not cover the command round-trip. Without a deadline
-			// a proxy that reads CONNECT and never replies blocks the caller indefinitely while the
-			// cold path would have failed on time; apply the same budget here and clear it on
-			// success, because the deadline would otherwise outlive the hand-off and kill the tunnel.
+			// The warm connection already completed greeting and authentication, so the cold path's
+			// handshake budget does not cover the command round-trip. Bound it with the SAME budget
+			// AND the caller's own cancellation: closing the warm conn is what unblocks the reply
+			// read, so a proxy that reads CONNECT and stays silent cannot hold the caller past either
+			// deadline. (A read deadline alone would ignore ctx and could not be cleared safely once
+			// the connection is handed off as a tunnel.)
+			warmContext := ctx
+			cancelWarm := context.CancelFunc(func() {})
 			if c.handshakeTimeout > 0 {
-				_ = warm.conn.SetDeadline(time.Now().Add(c.handshakeTimeout))
+				warmContext, cancelWarm = context.WithTimeout(ctx, c.handshakeTimeout)
 			}
+			stopWarm := context.AfterFunc(warmContext, func() {
+				_ = warm.conn.Close()
+			})
 			warmResult, warmErr := c.preconnect.commandOnWarm(warm, command, address)
+			stopWarm()
+			cancelWarm()
 			if warmErr == nil {
-				if c.handshakeTimeout > 0 {
-					_ = warmResult.SetDeadline(time.Time{})
-				}
 				return warmResult, nil
 			}
-			// Exactly one cold retry follows; never a loop.
+			// The caller's own cancellation is terminal: do not start a cold dial for a request
+			// nobody is waiting for. A warm connection that merely failed (stale, reset, slow) still
+			// falls back to exactly one cold attempt.
+			if contextError := ctx.Err(); contextError != nil {
+				return nil, contextError
+			}
 		}
 	}
 	tcpConn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
