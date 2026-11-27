@@ -60,6 +60,10 @@ type Client struct {
 	handshakeTimeout time.Duration
 	preconnect       *preconnectPool}
 
+// warmReplyReadHook is a TEST SEAM, nil in production: it runs after a warm command's reply has been
+// read and before the cancellation callback is stopped, which is the exact interleaving the
+// independent review used to show that a cancelled hand-off could still deliver a closed connection.
+var warmReplyReadHook func()
 func NewClient(dialer N.Dialer, serverAddr M.Socksaddr, version Version, username string, password string) *Client {
 	return &Client{
 		version:    version,
@@ -172,10 +176,27 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 				_ = warm.conn.Close()
 			})
 			warmResult, warmErr := c.preconnect.commandOnWarm(warm, command, address)
-			stopWarm()
+			// The hook is a test seam: it runs exactly where the review's overlay test needed to
+			// interleave a cancellation with an already-buffered success reply.
+			if warmReplyReadHook != nil {
+				warmReplyReadHook()
+			}
+			stopped := stopWarm()
 			cancelWarm()
 			if warmErr == nil {
-				return warmResult, nil
+				if stopped {
+					return warmResult, nil
+				}
+				// The cancellation callback ran before it could be stopped, so it already closed the
+				// connection. Handing that dead conn to the caller would surface the failure at the
+				// first business read instead of here.
+				if warmResult != nil {
+					_ = warmResult.Close()
+				}
+				if contextError := ctx.Err(); contextError != nil {
+					return nil, contextError
+				}
+				// The configured budget expired as the reply arrived: stale warm, one cold fallback.
 			}
 			// The caller's own cancellation is terminal: do not start a cold dial for a request
 			// nobody is waiting for. A warm connection that merely failed (stale, reset, slow) still

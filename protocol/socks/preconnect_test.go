@@ -651,3 +651,27 @@ func TestWarmCommandHonoursCallerCancellation(t *testing.T) {
 	require.EqualValues(t, 1, server.commands.Load(),
 		"a cancelled request must not start a cold dial")
 }
+
+// TestCancelledHandoffNeverDeliversAClosedConnection is the remainder of FUS2-P1-02 found in round 3:
+// when the reply is already buffered, the cancellation callback can run before stopWarm(), so a naive
+// implementation returns the (now closed) connection with a nil error and the caller discovers it on
+// its first business read. The test seam runs exactly in that window.
+func TestCancelledHandoffNeverDeliversAClosedConnection(t *testing.T) {
+	server := newFakeSOCKSServer(t, func(s *fakeSOCKSServer) { s.requireAuth = true })
+	client := newStartedPooledClient(t, server, PreconnectOptions{MinIdle: 1, MaxIdle: 1, IdleTimeout: 10 * time.Second})
+	client.SetHandshakeTimeout(5 * time.Second)
+	waitFor(t, "one parked authenticated connection", func() bool { return client.preconnect.idleCount() >= 1 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	commandsBefore := server.commands.Load()
+	warmReplyReadHook = func() { cancel() }
+	defer func() { warmReplyReadHook = nil }()
+
+	conn, err := client.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddrHostPort("example.com", 443))
+	require.ErrorIs(t, err, context.Canceled,
+		"a cancellation that won the hand-off race must be reported, not papered over with a closed conn")
+	require.Nil(t, conn, "no connection may be handed to the caller after the callback ran")
+	require.EqualValues(t, commandsBefore+1, server.commands.Load(),
+		"a cancelled hand-off must not start a cold dial")
+}
