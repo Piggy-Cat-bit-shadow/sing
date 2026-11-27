@@ -337,16 +337,16 @@ func (p *preconnectPool) idleCount() int {
 // rebind, a server reset, a broken path - so a failure BEFORE the command is
 // accepted closes the connection and asks for exactly one cold retry.
 //
-// Retry semantics at the hand-off boundary, which the caller implements and this
-// function's return value drives:
-//   - the caller's context cancelled: NO cold retry (nobody is waiting for it);
-//   - the configured handshake budget expiring before the reply is consumed: ONE cold
-//     retry, even when the proxy already received the first CONNECT - the warm
-//     connection is treated as stale, and the duplicate CONNECT is the accepted cost
-//     of not failing a request that a cold dial could still serve;
-//   - the reply consumed successfully but the cancellation callback winning the
-//     hand-off race: NO hand-off and NO cold retry (the caller already gave up).
-// A failure AFTER a successful, un-cancelled hand-off is never retried, because the
+// Retry semantics at the hand-off boundary, which the caller implements and this function's return
+// value drives. The cancellation callback fires for BOTH triggers, and the caller distinguishes them by
+// looking at its own context after the callback is stopped:
+//   - the caller's context cancelled: no hand-off and NO cold retry (nobody is waiting for it);
+//   - the configured handshake budget expiring while the caller is still waiting: ONE cold retry,
+//     even when the proxy already received the first CONNECT - the warm connection is treated as
+//     stale, and the duplicate CONNECT is the accepted cost of not failing a request a cold dial can
+//     still serve;
+//   - the reply read and the callback stopped in time: hand off the live connection; never retry after
+//     a live hand-off.// A failure AFTER a successful, un-cancelled hand-off is never retried, because the
 // tunnel is live and retrying would duplicate the command.
 func (p *preconnectPool) commandOnWarm(warm *authenticatedConn, command byte, destination M.Socksaddr) (net.Conn, error) {
 	response, err := ClientCommand5(warm.conn, varbin.StubReader(warm.reader), command, destination)
