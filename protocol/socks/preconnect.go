@@ -337,18 +337,23 @@ func (p *preconnectPool) idleCount() int {
 // rebind, a server reset, a broken path - so a failure BEFORE the command is
 // accepted closes the connection and asks for exactly one cold retry.
 //
-// Retry semantics at the hand-off boundary, which the caller implements and this function's return
-// value drives. The cancellation callback fires for BOTH triggers, and the caller distinguishes them by
-// looking at its own context after the callback is stopped:
-//   - the caller's context cancelled: no hand-off and NO cold retry (nobody is waiting for it);
-//   - the configured handshake budget expiring while the caller is still waiting: ONE cold retry,
-//     even when the proxy already received the first CONNECT - the warm connection is treated as
-//     stale, and the duplicate CONNECT is the accepted cost of not failing a request a cold dial can
-//     still serve;
-//   - the reply read and the callback stopped in time: hand off the live connection; never retry after
-//     a live hand-off.// A failure AFTER a successful, un-cancelled hand-off is never retried, because the
-// tunnel is live and retrying would duplicate the command.
-func (p *preconnectPool) commandOnWarm(warm *authenticatedConn, command byte, destination M.Socksaddr) (net.Conn, error) {
+// Hand-off contract, which the caller implements and this function's return value drives.
+//
+// The cancellation callback fires for two different triggers, and the caller distinguishes them by
+// checking its OWN context after the callback is stopped:
+//
+//   - stopWarm() returns true: the reply was read and the callback was stopped in time. Hand off the
+//     live connection, and never retry after a live hand-off.
+//   - stopWarm() returns false: the callback already fired and closed the connection, even if a
+//     successful reply was already buffered. Check the original caller context:
+//       * cancelled -> do not hand off and do NOT retry (nobody is waiting for the request);
+//       * still valid (the derived handshake budget expired) -> treat the warm connection as stale and
+//         fall back to exactly ONE cold attempt, accepting the duplicate CONNECT the proxy has already
+//         seen.
+//
+// A failure BEFORE the command is accepted (stale, reset, rejected) closes the connection and asks for
+// exactly one cold retry for the same reason. A failure AFTER a successful hand-off is never retried,
+// because the tunnel is live and retrying would duplicate the command.func (p *preconnectPool) commandOnWarm(warm *authenticatedConn, command byte, destination M.Socksaddr) (net.Conn, error) {
 	response, err := ClientCommand5(warm.conn, varbin.StubReader(warm.reader), command, destination)
 	if err != nil {
 		p.discard(warm)
