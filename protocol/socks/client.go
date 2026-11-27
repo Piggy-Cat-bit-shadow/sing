@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -51,13 +52,13 @@ func ParseVersion(version string) (Version, error) {
 var _ N.Dialer = (*Client)(nil)
 
 type Client struct {
-	version    Version
-	dialer     N.Dialer
-	serverAddr M.Socksaddr
-	username   string
-	password   string
-	preconnect *preconnectPool
-}
+	version          Version
+	dialer           N.Dialer
+	serverAddr       M.Socksaddr
+	username         string
+	password         string
+	handshakeTimeout time.Duration
+	preconnect       *preconnectPool}
 
 func NewClient(dialer N.Dialer, serverAddr M.Socksaddr, version Version, username string, password string) *Client {
 	return &Client{
@@ -127,6 +128,10 @@ func NewClientFromURL(dialer N.Dialer, rawURL string) (*Client, error) {
 	return &client, nil
 }
 
+func (c *Client) SetHandshakeTimeout(timeout time.Duration) {
+	c.handshakeTimeout = timeout
+}
+
 func (c *Client) DialContext(ctx context.Context, network string, address M.Socksaddr) (result net.Conn, err error) {
 	network = N.NetworkName(network)
 	var command byte
@@ -162,6 +167,11 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 	tcpConn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)
 	if err != nil {
 		return nil, err
+	}
+	if c.handshakeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.handshakeTimeout)
+		defer cancel()
 	}
 	if ctx.Done() != nil {
 		handshakeConn := tcpConn

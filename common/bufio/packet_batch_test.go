@@ -616,7 +616,7 @@ func TestPacketBatchWriterMessageTooLongContinues(t *testing.T) {
 	require.ErrorIs(t, NewPacketBatchWriter(writer).WritePacketBatch(
 		testBuffers("too-large", "delivered"),
 		[]M.Socksaddr{destination, destination},
-	), errMessageTooLong)
+	), N.ErrPacketTooBig)
 	require.Equal(t, 1, writer.written, "the packet after the oversize one must still be attempted")
 }
 
@@ -625,7 +625,7 @@ func TestConnectedPacketBatchWriterMessageTooLongContinues(t *testing.T) {
 	writer := &testOversizePacketWriter{failAt: 1}
 	require.ErrorIs(t, NewConnectedPacketBatchWriter(writer).WriteConnectedPacketBatch(
 		testBuffers("too-large", "delivered"),
-	), errMessageTooLong)
+	), N.ErrPacketTooBig)
 	require.Equal(t, 1, writer.written, "the packet after the oversize one must still be attempted")
 }
 
@@ -638,7 +638,7 @@ type testOversizePacketWriter struct {
 func (w *testOversizePacketWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
 	w.count++
 	if w.count == w.failAt {
-		return errMessageTooLong
+		return N.ErrPacketTooBig
 	}
 	w.written++
 	buffer.Release()

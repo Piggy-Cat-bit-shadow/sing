@@ -1,8 +1,6 @@
 package bufio
 
 import (
-	"errors"
-
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
@@ -76,7 +74,7 @@ func (w *fallbackPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, dest
 		err := w.writer.WritePacket(buffer, destinations[index])
 		if err != nil {
 			buffer.Leak()
-			if errors.Is(err, errMessageTooLong) {
+			if N.IsPacketTooBig(err) {
 				messageTooLongErr = err
 				continue
 			}
@@ -97,7 +95,7 @@ func (w *fallbackConnectedPacketBatchWriter) WriteConnectedPacketBatch(buffers [
 		err := w.writer.WritePacket(buffer, M.Socksaddr{})
 		if err != nil {
 			buffer.Leak()
-			if errors.Is(err, errMessageTooLong) {
+			if N.IsPacketTooBig(err) {
 				messageTooLongErr = err
 				continue
 			}
