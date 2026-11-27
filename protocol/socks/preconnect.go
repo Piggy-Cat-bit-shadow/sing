@@ -344,8 +344,9 @@ func (p *preconnectPool) idleCount() int {
 //
 //   - stopWarm() returns true: the reply was read and the callback was stopped in time. Hand off the
 //     live connection, and never retry after a live hand-off.
-//   - stopWarm() returns false: the callback already fired and closed the connection, even if a
-//     successful reply was already buffered. Check the original caller context:
+//   - stopWarm() returns false: the callback has fired or is still running, so the warm connection is
+//     being closed (the caller also closes the returned result before dropping it), even if a successful
+//     reply was already buffered. Check the original caller context:
 //       * cancelled -> do not hand off and do NOT retry (nobody is waiting for the request);
 //       * still valid (the derived handshake budget expired) -> treat the warm connection as stale and
 //         fall back to exactly ONE cold attempt, accepting the duplicate CONNECT the proxy has already
