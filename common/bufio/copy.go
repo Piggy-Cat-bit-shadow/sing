@@ -296,6 +296,9 @@ func CopyConn(ctx context.Context, source net.Conn, destination net.Conn) error 
 func CopyPacket(destinationConn N.PacketWriter, source N.PacketReader) (n int64, err error) {
 	var readCounters, writeCounters []N.CountFunc
 	originSource := source
+	// delivered, not n > 0: an empty packet is still a packet, and a session that has already
+	// handed one to the destination is past its handshake whatever its byte count says.
+	delivered := false
 	for {
 		source, readCounters = N.UnwrapCountPacketReader(source, readCounters)
 		destinationConn, writeCounters = N.UnwrapCountPacketWriter(destinationConn, writeCounters)
@@ -303,17 +306,18 @@ func CopyPacket(destinationConn N.PacketWriter, source N.PacketReader) (n int64,
 			packet := cachedReader.ReadCachedPacket()
 			if packet != nil {
 				var cachedN int64
-				cachedN, err = writePacketWithPool(originSource, destinationConn, []*N.PacketBuffer{packet}, readCounters, writeCounters, n > 0)
+				cachedN, err = writePacketWithPool(originSource, destinationConn, []*N.PacketBuffer{packet}, readCounters, writeCounters, delivered)
 				n += cachedN
 				if err != nil {
 					return
 				}
+				delivered = true
 				continue
 			}
 		}
 		break
 	}
-	copeN, err := copyPacketWithCounters(destinationConn, source, originSource, readCounters, writeCounters, n > 0)
+	copeN, err := copyPacketWithCounters(destinationConn, source, originSource, readCounters, writeCounters, delivered)
 	n += copeN
 	return
 }
@@ -395,6 +399,12 @@ func copyPacketWithCounters(destinationConn N.PacketWriter, source N.PacketReade
 	// the first packet (plus any sniffed extra packets) of every UDP flow that sniffing read.
 	// Without this loop, a sniffed session never reaches the batch path its inbound connection
 	// provides.
+	// delivered records that at least one packet has reached the destination, which is what
+	// "not the first packet" means for handshake accounting. It is NOT the byte count: a cached
+	// packet may legitimately be empty, and inferring the flag from n left the packet after an
+	// empty one classified as the session's first, so ITS failure was reported as a handshake
+	// failure on a session whose handshake had already happened.
+	delivered := notFirstTime
 	for {
 		sourceReader, readCounters = N.UnwrapCountPacketReader(sourceReader, readCounters)
 		destinationWriter, writeCounters = N.UnwrapCountPacketWriter(destinationWriter, writeCounters)
@@ -402,11 +412,12 @@ func copyPacketWithCounters(destinationConn N.PacketWriter, source N.PacketReade
 			packet := cachedReader.ReadCachedPacket()
 			if packet != nil {
 				var cachedN int64
-				cachedN, err = writePacketWithPool(originSource, destinationWriter, []*N.PacketBuffer{packet}, readCounters, writeCounters, notFirstTime || n > 0)
+				cachedN, err = writePacketWithPool(originSource, destinationWriter, []*N.PacketBuffer{packet}, readCounters, writeCounters, delivered)
 				n += cachedN
 				if err != nil {
 					return
 				}
+				delivered = true
 				continue
 			}
 		}
@@ -424,7 +435,7 @@ func copyPacketWithCounters(destinationConn N.PacketWriter, source N.PacketReade
 	}
 	for {
 		var copyN int64
-		copyN, err = copyPacketWithCountersOnce(session, notFirstTime || n > 0)
+		copyN, err = copyPacketWithCountersOnce(session, delivered)
 		n += copyN
 		if errors.Is(err, N.ErrHandshakeCompleted) {
 			refreshUnwrap()
