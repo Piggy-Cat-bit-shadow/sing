@@ -127,6 +127,45 @@ func (w *batchSessionWriter) WritePacketBatch(buffers []*buf.Buffer, _ []M.Socks
 	return nil
 }
 
+// TestNestedCachedFirstPacketsStillKeepTheBatchPath covers the shape route actually builds.
+//
+// route wraps EVERY extra packet sniffing read, in reverse, so a flow whose sniffer needed two
+// packets arrives here as two nested CachedPacketConns, not one. The drain loop has to peel the
+// outer cache, deliver it, then unwrap THROUGH the now-taken outer connection to reach the inner
+// one. A fix that only drains one level would pass the single-cache test above and still leave the
+// batch path unreachable in production, which is the failure this test exists to prevent.
+func TestNestedCachedFirstPacketsStillKeepTheBatchPath(t *testing.T) {
+	const datagrams = 4
+	const datagramSize = 1200
+	destination := M.SocksaddrFrom(M.ParseAddr("127.0.0.1"), 9999)
+
+	newCachedPacket := func(payload string) *buf.Buffer {
+		cached := buf.NewPacket()
+		_, err := cached.Write([]byte(payload))
+		require.NoError(t, err)
+		return cached
+	}
+
+	for _, depth := range []int{1, 2, 3} {
+		source := newBatchSession(datagrams, datagramSize)
+		sink := newBatchSession(0, 0)
+		var conn N.PacketConn = source
+		for level := 0; level < depth; level++ {
+			conn = NewCachedPacketConn(conn, newCachedPacket("first-packet"), destination)
+		}
+		_, err := CopyPacketWithCounters(sink, conn, conn, nil, nil)
+		require.True(t, errors.Is(err, io.EOF), "depth=%d: ended with %v", depth, err)
+
+		t.Logf("depth=%d: batchWrites=%d singleWrites=%d",
+			depth, sink.batchWrites.Load(), sink.writePackets.Load())
+
+		require.Equal(t, int32(depth+datagrams), sink.writePackets.Load(),
+			"depth=%d: every cached packet and every datagram must arrive exactly once", depth)
+		require.NotZero(t, sink.batchWrites.Load(),
+			"depth=%d: nested caches left the batch path unreachable; the drain loop peeled only one level", depth)
+	}
+}
+
 // TestCachedFirstPacketKeepsTheBatchPath is the regression this file exists for.
 //
 // It asserts equality between the two entry points rather than a number specific to one of
