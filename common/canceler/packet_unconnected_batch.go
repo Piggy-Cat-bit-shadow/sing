@@ -16,13 +16,24 @@ import (
 // hands every datagram to one fixed peer asks for. They are not what a NAT session asks for:
 // a NAT session writes each datagram to its own destination, so the copy engine reaches for
 // `N.CreatePacketBatchWriter` / `N.CreatePacketBatchReadWaiter` - the unconnected pair - and
-// neither wrapper implemented them. The wrapper is installed on every UDP session with a
-// timeout, which is every UDP NAT session, so:
+// neither wrapper implemented them.
+//
+// # How far this reaches, measured rather than assumed
+//
+// NewPacketConn does NOT wrap every UDP session. It first looks for a caller that already owns
+// its timeout (`common.Cast[PacketConn](conn)`, which walks `Upstream()`), and returns the
+// connection untouched when it finds one. sing-tun's `UDPNatConn` and `udpnat2`'s `natConn` both
+// do, so a TUN, shadowsocks or direct NAT session never sees these wrappers at all.
+//
+// What does get wrapped is a packet connection with no timeout of its own - SOCKS5 UDP
+// associate is the production case - and there the loss was real:
 //
 //	conn with batch  ->  canceler.NewPacketConn  ->  batch invisible  ->  one syscall per datagram
 //
-// Nothing failed, which is why this survived: the datagrams still arrive, they just each cost
-// their own syscall on the hottest UDP path in the process.
+// This is a contract fix with a bounded production surface, not a fix for every UDP flow. It is
+// still worth having: the wrapper is a general-purpose one, a caller that adds a batch-capable
+// connection without its own timeout would hit the same wall, and the asymmetry with the
+// connected half is the kind of gap that survives precisely because nothing fails.
 //
 // # Why the wrapper cannot hand the inner capability straight back
 //

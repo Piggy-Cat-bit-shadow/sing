@@ -381,6 +381,37 @@ func CopyPacketWithCounters(destinationConn N.PacketWriter, source N.PacketReade
 func copyPacketWithCounters(destinationConn N.PacketWriter, source N.PacketReader, originSource N.PacketReader, readCounters []N.CountFunc, writeCounters []N.CountFunc, notFirstTime bool) (n int64, err error) {
 	sourceReader := source
 	destinationWriter := destinationConn
+	// Drain N.CachedPacketReader BEFORE the session is built, exactly as CopyPacket and
+	// copyWithIncreateBuffer do.
+	//
+	// A CachedPacketConn is deliberately not replaceable until its cached packet has been
+	// taken: forwarding the inner reader earlier would let a batch read skip the cached bytes
+	// and lose the first packet. But capability probing happens once, when the session is
+	// built, and the per-packet loop it can fall back to never probes again. So probing while
+	// the cache is still held locks the WHOLE session into one write per datagram, and the
+	// cache being drained a moment later changes nothing.
+	//
+	// This entry point is the one route/conn.go's packetConnectionCopy calls, and route wraps
+	// the first packet (plus any sniffed extra packets) of every UDP flow that sniffing read.
+	// Without this loop, a sniffed session never reaches the batch path its inbound connection
+	// provides.
+	for {
+		sourceReader, readCounters = N.UnwrapCountPacketReader(sourceReader, readCounters)
+		destinationWriter, writeCounters = N.UnwrapCountPacketWriter(destinationWriter, writeCounters)
+		if cachedReader, isCached := sourceReader.(N.CachedPacketReader); isCached {
+			packet := cachedReader.ReadCachedPacket()
+			if packet != nil {
+				var cachedN int64
+				cachedN, err = writePacketWithPool(originSource, destinationWriter, []*N.PacketBuffer{packet}, readCounters, writeCounters, notFirstTime || n > 0)
+				n += cachedN
+				if err != nil {
+					return
+				}
+				continue
+			}
+		}
+		break
+	}
 	session := newPacketCopySession(destinationWriter, sourceReader, originSource, readCounters, writeCounters)
 	refreshUnwrap := func() {
 		sourceReader, readCounters = N.UnwrapCountPacketReader(sourceReader, readCounters)
